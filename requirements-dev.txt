@@ -1,0 +1,6 @@
+# Test-only dependencies. Kept in a separate file so CI and tests/run_local.py
+# install the exact same set and a "works locally, fails in CI" mismatch cannot
+# arise from the two drifting apart.
+-r requirements.txt
+pytest>=8.0
+moto[s3,server]>=5.0
