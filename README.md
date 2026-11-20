@@ -302,7 +302,7 @@ cd tests && python3 -m pytest -v
 `PGPASSWORD` has to be non-empty even against a `trust` server, because
 the tools require `--password` to be supplied.
 
-CI runs this on every push against PostgreSQL 14 through 17 service containers,
+CI runs this on every push against PostgreSQL 14 through 18 service containers,
 plus `ruff format --check` and `ruff check`. See
 `.github/workflows/ci.yml`.
 
