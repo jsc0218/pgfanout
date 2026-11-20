@@ -1,9 +1,12 @@
-# Parallel PostgreSQL Backup
+# pgfanout
 
-Fast, streaming, parallel `pg_dump` / `pg_restore` replacement that can
-write directly to **local disk or S3-compatible object storage** — no
-intermediate staging, no server-side file privileges, and no
-`pg_dump`/`pg_restore` parallelism caps (we roll our own).
+Parallel logical dump and restore for PostgreSQL. It fans a single
+table out across parallel page-range workers and rebuilds indexes in
+parallel on restore, and it streams straight to **local disk or
+S3-compatible object storage**. It is a `pg_dump` / `pg_restore`
+replacement with no intermediate staging, no server-side file
+privileges, and no `pg_dump`/`pg_restore` parallelism caps (we roll our
+own).
 
 It works against any PostgreSQL server you can reach over libpq — there
 is nothing vendor-specific in it. Data bytes flow from Postgres through
