@@ -35,11 +35,25 @@ name: Benchmark
 #   * The dataset is one plain 795 MB table with no indexes, so it does not
 #     exercise index builds or many-table parallelism.
 #
+# When it runs
+#   * on pull requests that touch the code (PR against its base branch);
+#   * on every push to main that touches the code (the new commit against the
+#     commit before the push), so a regression that slips in is caught and each
+#     merge leaves a result in the run's artifacts;
+#   * on demand (workflow_dispatch).
+# There is deliberately no schedule trigger.
+#
 # It is advisory by default: it fails only when "enforce" is turned on
-# (workflow_dispatch). There is deliberately no schedule trigger; it runs on
-# pull requests that touch the code, and on demand.
+# (workflow_dispatch).
 on:
   pull_request:
+    paths:
+      - 'src/**'
+      - 'bench/**'
+      - 'pyproject.toml'
+      - '.github/workflows/bench.yml'
+  push:
+    branches: [main]
     paths:
       - 'src/**'
       - 'bench/**'
@@ -64,9 +78,12 @@ on:
         type: boolean
         default: false
 
+# A newer push to a pull request replaces its run, but runs on main are never
+# cancelled by a later merge, so each merge keeps its own result (GitHub still
+# keeps only one run waiting, so a burst of merges can skip an intermediate one).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -96,7 +113,7 @@ jobs:
       PGPORT: 5432
       PGUSER: postgres
       PGPASSWORD: postgres
-      BASE: ${{ github.event.pull_request.base.sha || inputs.base_ref }}
+      BASE: ${{ github.event.pull_request.base.sha || github.event.before || inputs.base_ref }}
       SIZE_MB: ${{ inputs.size_mb || '1024' }}
       REPEATS: ${{ inputs.repeats || '5' }}
       THRESHOLD: ${{ inputs.threshold || '0.10' }}
@@ -123,9 +140,24 @@ jobs:
           sudo apt-get install -y --no-install-recommends postgresql-client-17
           echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
 
-      - name: Install base and PR builds into separate virtualenvs
+      - name: Resolve the base commit
+        id: base
         run: |
-          git worktree add /tmp/base-src "$BASE"
+          base="$BASE"
+          # A push that creates a branch has an all-zero "before", and a force
+          # push can leave "before" unreachable. Compare with the parent then.
+          if [ -z "$base" ] \
+             || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base=HEAD^
+          fi
+          echo "sha=$(git rev-parse "$base")" >> "$GITHUB_OUTPUT"
+
+      - name: Install base and PR builds into separate virtualenvs
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          git worktree add /tmp/base-src "$BASE_SHA"
           python3 -m venv /tmp/venv-base
           /tmp/venv-base/bin/pip install -q /tmp/base-src
           python3 -m venv /tmp/venv-pr
@@ -141,7 +173,13 @@ jobs:
             --out bench-results.json
 
       - name: Compare and report
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
         run: |
+          {
+            echo "Comparing base \`${BASE_SHA:0:7}\` with head \`$(git rev-parse --short HEAD)\` (${GITHUB_EVENT_NAME})."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
           fail=""
           if [ "$ENFORCE" = "true" ]; then fail="--fail"; fi
           set +e
