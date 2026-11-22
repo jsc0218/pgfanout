@@ -1,0 +1,17 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+ignore = [
+    "E501", # line too long; guidance rather than a hard failure
+]
+select = [
+    "E",  # pycodestyle
+    "F",  # Pyflakes
+    "I",  # isort
+    "W",  # pycodestyle
+    "B",  # bugbear
+    "UP", # pyupgrade
+    "TC", # flake8-type-checking
+]
