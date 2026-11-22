@@ -1,27 +1,33 @@
 # pgfanout
 
-Parallel logical dump and restore for PostgreSQL. It fans a single
-table out across parallel page-range workers and rebuilds indexes in
-parallel on restore, and it streams straight to **local disk or
-S3-compatible object storage**. It is a `pg_dump` / `pg_restore`
-replacement with no intermediate staging, no server-side file
-privileges, and no `pg_dump`/`pg_restore` parallelism caps (we roll our
-own).
+[![CI](https://github.com/jsc0218/pgfanout/actions/workflows/ci.yml/badge.svg)](https://github.com/jsc0218/pgfanout/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/pgfanout.svg)](https://pypi.org/project/pgfanout/)
+[![Python](https://img.shields.io/pypi/pyversions/pgfanout.svg)](https://pypi.org/project/pgfanout/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14%20%7C%2015%20%7C%2016%20%7C%2017%20%7C%2018-336791.svg)](#install)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/jsc0218/pgfanout/blob/main/LICENSE)
 
-It works against any PostgreSQL server you can reach over libpq — there
-is nothing vendor-specific in it. Data bytes flow from Postgres through
-a `psql` subprocess and a pipe straight into the storage sink (local
-file or S3 multipart upload), chunk by chunk, so a 1 TB table does not
-need 1 TB of local disk.  Python sits on the
-*control* plane (snapshot export, catalog discovery, SIGINT
-cancellation via `psycopg`) but is deliberately kept off the data hot
-path — a design choice dictated by the GIL, which would otherwise
-serialise per-chunk COPY parsing across parallel workers.
+Parallel logical dump and restore for PostgreSQL. `pgfanout-dump` and
+`pgfanout-restore` replace `pg_dump` / `pg_restore`: they split a single
+table across parallel page-range workers under one consistent snapshot,
+rebuild indexes in parallel on restore, and stream table data straight
+to **local disk or S3-compatible object storage**, with no staging copy
+of the data and no server-side file privileges.
+
+It works against any PostgreSQL server you can reach over libpq, and
+there is nothing vendor-specific in it. Data bytes flow from Postgres
+through a `psql` subprocess and a pipe into the storage sink (local file
+or S3 multipart upload), chunk by chunk, so a 1 TB table does not need
+1 TB of local disk. Python runs the *control* plane (snapshot export,
+catalog discovery, SIGINT cancellation via `psycopg`). For local files it
+stays off the data path entirely; for S3 it relays each chunk so it can
+be sent as a multipart upload. See
+[Architecture at a glance](#architecture-at-a-glance).
 
 ## Contents
 
 - [When to reach for this](#when-to-reach-for-this)
 - [Architecture at a glance](#architecture-at-a-glance)
+- [Install](#install)
 - [Quick start](#quick-start)
 - [CLI reference](#cli-reference)
 - [S3 configuration](#s3-configuration)
@@ -33,15 +39,16 @@ serialise per-chunk COPY parsing across parallel workers.
 Use this tool when the builtin `pg_dump -Fd -j N` / `pg_restore -j N` is
 too slow or does not fit your operational constraints:
 
-* **Very large tables**, where parallel dumping within a consistent
-  snapshot across physical page ranges (via `ctid`-range scans) is
-  significantly faster than `pg_dump`'s one-worker-per-relation split.
+* **Very large tables**, where `pg_dump -Fd -j N` still dumps each
+  relation with a single worker. pgfanout splits one table across
+  physical page ranges (`ctid`-range scans) within one consistent
+  snapshot, so its workers run in parallel.
 * **Stateless compute**, where you cannot afford to materialize the
   dump on local disk before uploading.  This tool can stream every
   byte directly to S3.
 * **Multi-tenant / multi-schema restores**, where you want the restore
   phases (data → indexes → FKs → sequences → matviews) laid out
-  explicitly and tunable per phase.
+  explicitly.
 * **Slow indexes**, where you want to restore data first at full
   bandwidth and then rebuild indexes in parallel at the end
   (`--index-jobs`).
@@ -49,8 +56,8 @@ too slow or does not fit your operational constraints:
 ## Architecture at a glance
 
 ```
-parallel_dump.py                  parallel_restore.py
-─────────────────                 ──────────────────────
+pgfanout-dump                     pgfanout-restore
+─────────────                     ────────────────
   1. pg_export_snapshot()           1. discover <schema>/<table>/ dirs
        (psycopg, held open)         2. apply pre_data.sql     (psql -f)
   2. pg_dump DDL                    3. COPY FROM workers:
@@ -64,36 +71,35 @@ parallel_dump.py                  parallel_restore.py
 
 ### Control plane vs data plane
 
-The split is deliberate:
+The split is deliberate: the GIL would otherwise serialise per-chunk
+COPY parsing across parallel workers.
 
 | Plane   | Carrier            | What runs there                                                    |
 |---------|--------------------|--------------------------------------------------------------------|
 | Control | `psycopg` in Python | snapshot export/hold, catalog queries (schemas, tables, matviews), `pg_relation_size` for page-range planning, `cancel_safe()` on SIGINT |
 | Data    | `psql` subprocess   | COPY TO STDOUT / COPY FROM STDIN for every data part; `pg_dump` / `pg_restore` for DDL and index rebuilds |
 
-Python code never touches the payload bytes in the COPY path.
-`common.stream_subprocess_to_sink` (dump) and
-`common.stream_source_to_subprocess` (restore) connect the `psql`
+For local files, Python never touches the payload bytes in the COPY
+path; for S3 it relays them chunk by chunk (see the second path below).
+`pgfanout.common.stream_subprocess_to_sink` (dump) and
+`pgfanout.common.stream_source_to_subprocess` (restore) connect the `psql`
 subprocess to the `Blob` via one of two paths, picked automatically
 per-call based on the destination type:
 
 * **OS-direct fast-path** — when the `Blob` exposes a real OS file
-  descriptor (every `LocalBlob`, plus any future backend with a real
-  fd), the helpers hand the fd straight to `subprocess.Popen` as
+  descriptor (every `LocalBlob`), the helpers hand the fd straight to `subprocess.Popen` as
   `stdout=` (dump) or `stdin=` (restore).  Popen calls `dup2(fd, 1/0)`
   in the child, so the subprocess writes to (or reads from) the file
   via its own libc `write()` / `read()` syscalls — *zero* Python in
   the data path of our process, no GIL traffic from the streaming
-  step.  N parallel workers scale linearly with CPU cores the same
-  way the pre-refactor `psql … > part.bin` shell-redirected pipeline
-  did.  A small daemon thread polls `os.fstat(fd).st_size` once a
+  step.  N parallel workers therefore do not contend on the GIL.  A small daemon thread polls `os.fstat(fd).st_size` once a
   second to feed live progress into the shared `bytes_written` dict
   that `progress_monitor` consumes.
 * **Python read/write fallback** — when the `Blob` is a Python class
   (`_S3MultipartWriter`, `_S3StreamReader`) the bytes have to traverse
   Python so multipart upload buffers can chunk them.  The familiar
   `while True: chunk = read(); write(chunk)` loop pumps the data with
-  per-chunk `bytes_callback` updates, exactly as before.  This is
+  per-chunk `bytes_callback` updates.  This is
   also the path used by tests that hand in `io.BytesIO`.
 
 Either way the subprocess stays registered in the cancel registry, a
@@ -122,9 +128,15 @@ cleaned up even on exceptions.
 pip install pgfanout
 ```
 
-This installs two commands, `pgfanout-dump` and `pgfanout-restore`. You
-also need the PostgreSQL client tools (`psql`, `pg_dump`, `pg_restore`) on
-your `PATH`, with the same major version as the server.
+This installs two commands, `pgfanout-dump` and `pgfanout-restore`.
+
+Requirements:
+
+* Python 3.10 or newer.
+* A PostgreSQL 14+ server (the dump uses TID range scans, added in 14).
+* The PostgreSQL client tools (`psql`, `pg_dump`, `pg_restore`) on your
+  `PATH`, with the same major version as the server, because `pg_dump`
+  refuses to talk to a newer server.
 
 ## Quick start
 
@@ -183,8 +195,10 @@ pgfanout-restore \
 | `--database`    | ✓        |         |                                               |
 | `--config PATH` |          | auto    | TOML file; see [Config file](#config-file)    |
 | `--retries N`   |          | `0`     | Per-part retry budget on transient errors     |
+| `--log-format`  |          | `text`  | `text` or `json`                              |
+| `--log-level`   |          | `info`  | `debug`, `info`, `warning` or `error`         |
 
-### `parallel_dump.py`
+### `pgfanout-dump`
 
 | Flag              | Default | Notes                                                               |
 |-------------------|--------:|---------------------------------------------------------------------|
@@ -201,18 +215,19 @@ Output layout:
   plus top-level `global_pre_data.dump` and `global_post_data.dump`
   for extensions, enums, event triggers, etc.
 
-### `parallel_restore.py`
+### `pgfanout-restore`
 
 | Flag              | Default | Notes                                                                        |
 |-------------------|--------:|------------------------------------------------------------------------------|
 | `--table T`       |         | Omit for database-level restore (auto-detects `<schema>/<table>/` layout)    |
 | `--schema S`      | `public`| Only with `--table`                                                          |
 | `--index-jobs N`  | `1`     | Parallel `pg_restore -j N` for index / constraint build                      |
-| `--unlogged`      | off     | `ALTER TABLE … SET UNLOGGED` during load, `SET LOGGED` after — big speedup   |
-| `--input-dir D`   |         | Local path **or** `s3://bucket/prefix`                                       |
+| `--unlogged`      | off     | `ALTER TABLE … SET UNLOGGED` during load, `SET LOGGED` after; much faster, but a server crash mid-load truncates the table and the restore must start over |
+| `--input-dir D`   |         | **Required.** Local path **or** `s3://bucket/prefix`                         |
 
 The restore is idempotent within a database: each invocation drops and
-recreates its tables before loading.
+recreates its tables before loading. In database-level mode the drop uses
+`CASCADE`, so objects that depend on those tables are dropped too.
 
 ## S3 configuration
 
@@ -250,8 +265,9 @@ pgfanout-dump ... --output-dir s3://rdb-poc/backups/mydb
 
 * Upload: `_S3MultipartWriter` streams data in fixed-size chunks
   (default 16 MiB, minimum 5 MiB per S3 spec) and completes the
-  multipart upload on close.  Objects smaller than one chunk fall
-  back to a single `PutObject`.
+  multipart upload on close.  The final part may be smaller than the
+  chunk size.  An empty object is written with a plain `PutObject`,
+  because S3 rejects a multipart upload with zero parts.
 * Download / restore: `S3Blob.open_read()` returns a boto3
   `StreamingBody` that supports chunked `read()` — no full-object
   materialization in memory.
@@ -280,6 +296,10 @@ database = "mydb"
 num_parts = 8
 output_dir = "s3://my-bucket/dumps/mydb"
 retries = 2
+
+[logging]
+format = "text"
+level = "info"
 
 [restore]
 input_dir = "s3://my-bucket/dumps/mydb"
@@ -312,9 +332,9 @@ cd tests && python3 -m pytest -v
 `PGPASSWORD` has to be non-empty even against a `trust` server, because
 the tools require `--password` to be supplied.
 
-CI runs this on every push against PostgreSQL 14 through 18 service containers,
-plus `ruff format --check` and `ruff check`. See
-`.github/workflows/ci.yml`.
+CI runs this on every push against PostgreSQL 14 through 18 service
+containers, plus `ruff format --check`, `ruff check`, and a package
+build check. See `.github/workflows/ci.yml`.
 
 Test layout:
 
@@ -329,14 +349,16 @@ Test layout:
 | `test_parallel_backup.py`         | End-to-end dump + restore round-trip on local disk                    |
 | `test_parallel_backup_s3.py`      | End-to-end dump + restore round-trip on S3 (via `moto.server`)        |
 
-The standalone scripts below are **not** unit tests (they're excluded
-from pytest discovery via `conftest.py::collect_ignore`); they require
-real credentials and a real S3 endpoint:
+`test_s3_connectivity.py` is a standalone script, not a unit test. It is
+excluded from pytest discovery via `conftest.py::collect_ignore` and needs
+real credentials and a real S3 endpoint. It reads `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `S3_BUCKET`, and the optional endpoint/TLS/region
+variables from the environment.
 
-* `test_s3_connectivity.py` — confirm the bucket is reachable (reads
-  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_BUCKET`, and the
-  optional endpoint/TLS/region vars from the environment — never hard-code
-  credentials in source)
+It is **not read-only**: it uploads, downloads and then deletes an object at
+`S3_TEST_KEY` (default `backup-test/connectivity-test.txt`). An existing
+object at that key is overwritten and then deleted, so point `S3_TEST_KEY`
+at an unused key before running it against a bucket that holds real data.
 
 ## License
 
