@@ -32,6 +32,7 @@ be sent as a multipart upload. See
 - [CLI reference](#cli-reference)
 - [S3 configuration](#s3-configuration)
 - [Config file](#config-file)
+- [Benchmarks](#benchmarks)
 - [Running the tests](#running-the-tests)
 
 ## When to reach for this
@@ -307,6 +308,37 @@ index_jobs = 4
 unlogged = false
 retries = 1
 ```
+
+## Benchmarks
+
+`bench/bench.py` generates a deterministic dataset, then runs dump, restore
+and a row-count check for each variant you give it, interleaving the
+variants and discarding a warm-up round so machine noise hits all of them
+equally. `bench/compare.py` turns the JSON into a table and a verdict.
+
+```bash
+export PGHOST=localhost PGPORT=5432 PGUSER=postgres PGPASSWORD=postgres
+python3 bench/bench.py \
+    --variant pr=pgfanout:.venv/bin \
+    --variant pg_dump=pgdump \
+    --size-mb 1024 --repeats 5 --out results.json
+python3 bench/compare.py results.json --base pr --pr pr --reference pg_dump
+```
+
+The `pg_dump` variant runs `pg_dump -Fd -Z 0 -j N` and `pg_restore -j N`,
+uncompressed so the comparison is like for like. Use `--variant
+NAME=pgfanout:BINDIR` once per build to compare two builds, for example an
+installed release and your working tree.
+
+The **Benchmark** workflow does this on pull requests that touch `src/` or
+`bench/`: it builds the base branch and the PR into separate virtualenvs on
+the same runner, compares the median times, and writes a table to the job
+summary. It is advisory by default and never runs on a schedule. Start it
+by hand from the Actions tab (**Benchmark → Run workflow**) to choose the
+dataset size, the number of rounds, the threshold, and whether a regression
+fails the job. GitHub-hosted runners are noisy, so it only catches large
+regressions (the default threshold is 20%); use a dedicated machine for
+numbers you intend to publish.
 
 ## Running the tests
 

@@ -1,0 +1,130 @@
+name: Benchmark
+
+# Compares a pull request against its base branch on the same runner, in
+# the same job, with the runs interleaved, so machine noise affects both
+# sides equally. It is advisory by default: it posts a table to the job
+# summary and fails only when "enforce" is turned on.
+#
+# There is deliberately no schedule trigger; it runs on pull requests that
+# touch the code, and on demand.
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'bench/**'
+      - 'pyproject.toml'
+      - '.github/workflows/bench.yml'
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'Git ref to compare against'
+        default: origin/main
+      size_mb:
+        description: 'Approximate dataset size in MB'
+        default: '1024'
+      repeats:
+        description: 'Measured rounds per variant'
+        default: '5'
+      threshold:
+        description: 'Allowed slowdown, as a fraction (0.20 = 20%)'
+        default: '0.20'
+      enforce:
+        description: 'Fail the job on a regression'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: pgfanout vs base (PostgreSQL 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      BASE: ${{ github.event.pull_request.base.sha || inputs.base_ref }}
+      SIZE_MB: ${{ inputs.size_mb || '1024' }}
+      REPEATS: ${{ inputs.repeats || '5' }}
+      THRESHOLD: ${{ inputs.threshold || '0.20' }}
+      ENFORCE: ${{ inputs.enforce || 'false' }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install matching PostgreSQL client
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      - name: Install base and PR builds into separate virtualenvs
+        run: |
+          git worktree add /tmp/base-src "$BASE"
+          python3 -m venv /tmp/venv-base
+          /tmp/venv-base/bin/pip install -q /tmp/base-src
+          python3 -m venv /tmp/venv-pr
+          /tmp/venv-pr/bin/pip install -q .
+
+      - name: Run benchmark
+        run: |
+          python3 bench/bench.py \
+            --variant base=pgfanout:/tmp/venv-base/bin \
+            --variant pr=pgfanout:/tmp/venv-pr/bin \
+            --variant pg_dump=pgdump \
+            --size-mb "$SIZE_MB" --repeats "$REPEATS" --jobs 4 \
+            --out bench-results.json
+
+      - name: Compare and report
+        run: |
+          fail=""
+          if [ "$ENFORCE" = "true" ]; then fail="--fail"; fi
+          set +e
+          python3 bench/compare.py bench-results.json \
+            --base base --pr pr --reference pg_dump \
+            --threshold "$THRESHOLD" $fail | tee report.md
+          status=${PIPESTATUS[0]}
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: |
+            bench-results.json
+            report.md
