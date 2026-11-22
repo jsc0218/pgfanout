@@ -150,7 +150,6 @@ def generate_dataset(conn: dict[str, str], size_mb: int) -> dict:
         """,
     )
     psql(conn, SRC_DB, "VACUUM ANALYZE")
-    psql(conn, SRC_DB, "CHECKPOINT")
 
     tables = psql(
         conn,
@@ -177,7 +176,41 @@ def settle(conn: dict[str, str]) -> None:
     time.sleep(0.5)
 
 
-def stabilize_server(conn: dict[str, str], size_mb: int, fsync_off: bool) -> None:
+TUNED_SETTINGS = ("max_wal_size", "checkpoint_timeout", "fsync")
+
+
+def read_overrides(conn: dict[str, str]) -> dict[str, str | None]:
+    """Current postgresql.auto.conf value of each tuned setting, or None.
+
+    ALTER SYSTEM RESET deletes an override instead of restoring the previous
+    one, so remember what was there to put it back exactly.
+    """
+    names = ",".join(f"'{n}'" for n in TUNED_SETTINGS)
+    rows = psql(
+        conn,
+        "postgres",
+        "SELECT name || '=' || setting FROM pg_file_settings "
+        f"WHERE sourcefile LIKE '%postgresql.auto.conf' AND name IN ({names}) "
+        "ORDER BY seqno",
+    )
+    found: dict[str, str | None] = dict.fromkeys(TUNED_SETTINGS)
+    for row in rows.splitlines():
+        name, _, value = row.partition("=")
+        found[name] = value  # later entries win, as they do on the server
+    return found
+
+
+def alter_system(conn: dict[str, str], name: str, value: str | None) -> None:
+    if value is None:
+        psql(conn, "postgres", f"ALTER SYSTEM RESET {name}")
+    else:
+        quoted = value.replace("'", "''")
+        psql(conn, "postgres", f"ALTER SYSTEM SET {name} = '{quoted}'")
+
+
+def stabilize_server(
+    conn: dict[str, str], size_mb: int, fsync_off: bool, touched: list[str]
+) -> None:
     """Take disk-sync and checkpoint noise out of the timed commands.
 
     The aim is to catch code regressions, not to produce absolute numbers, so
@@ -187,24 +220,30 @@ def stabilize_server(conn: dict[str, str], size_mb: int, fsync_off: bool) -> Non
       * fsync is turned off (unless fsync_off is False) so the result does not
         depend on how fast the runner's disk can sync, which is both noisy and
         outside the code under test.
-    Only settings that take effect on reload are touched, and
-    restore_server() undoes them at the end of the run. Do not publish
-    numbers taken this way; use --keep-fsync for those.
+    Only settings that take effect on reload are touched. Each setting is
+    appended to *touched* as soon as it has been changed, so that
+    restore_server() undoes exactly what was done even if this fails part-way.
+    Do not publish numbers taken this way; use --keep-fsync for those.
     """
     wal_mb = max(4096, 4 * size_mb)
-    psql(conn, "postgres", f"ALTER SYSTEM SET max_wal_size = '{wal_mb}MB'")
-    psql(conn, "postgres", "ALTER SYSTEM SET checkpoint_timeout = '1h'")
+    changes = [("max_wal_size", f"{wal_mb}MB"), ("checkpoint_timeout", "1h")]
     if fsync_off:
-        psql(conn, "postgres", "ALTER SYSTEM SET fsync = off")
+        changes.append(("fsync", "off"))
+    for name, value in changes:
+        alter_system(conn, name, value)
+        touched.append(name)
     psql(conn, "postgres", "SELECT pg_reload_conf()")
     time.sleep(1)
 
 
-def restore_server(conn: dict[str, str]) -> None:
-    psql(conn, "postgres", "ALTER SYSTEM RESET max_wal_size")
-    psql(conn, "postgres", "ALTER SYSTEM RESET checkpoint_timeout")
-    psql(conn, "postgres", "ALTER SYSTEM RESET fsync")
-    psql(conn, "postgres", "SELECT pg_reload_conf()")
+def restore_server(
+    conn: dict[str, str], originals: dict[str, str | None], touched: list[str]
+) -> None:
+    """Put back the settings stabilize_server() changed, and only those."""
+    for name in touched:
+        alter_system(conn, name, originals[name])
+    if touched:
+        psql(conn, "postgres", "SELECT pg_reload_conf()")
 
 
 def verify(conn: dict[str, str], expected: dict[str, int], variant: str) -> None:
@@ -214,8 +253,13 @@ def verify(conn: dict[str, str], expected: dict[str, int], variant: str) -> None
             sys.exit(f"{variant}: {table} has {got} rows after restore, expected {want}")
 
 
-def pgfanout_cmds(bindir: str, conn: dict[str, str], jobs: int, out: Path):
+def pgfanout_cmds(bindir: str, conn: dict[str, str], jobs: int, out: Path, config: Path):
+    # An explicit (empty) config file stops pgfanout from picking up a
+    # ./pgfanout.toml or ~/.config/pgfanout/pgfanout.toml, which could change
+    # the table, the unlogged mode or the part count being measured.
     common = [
+        "--config",
+        str(config),
         "--host",
         conn["host"],
         "--port",
@@ -289,14 +333,72 @@ def main() -> None:
     ap.add_argument("--out", default="bench-results.json")
     args = ap.parse_args()
 
+    if args.repeats < 1:
+        ap.error("--repeats must be at least 1")
+    if args.warmup < 0:
+        ap.error("--warmup must not be negative")
+    if args.jobs < 1:
+        ap.error("--jobs must be at least 1")
+    if args.size_mb < 1:
+        ap.error("--size-mb must be at least 1")
     variants = [parse_variant(v) for v in args.variant]
     if len({n for n, _, _ in variants}) != len(variants):
-        sys.exit("variant names must be unique")
+        ap.error("variant names must be unique")
     conn = env_conn()
     env = {**os.environ, "PGPASSWORD": conn["password"]}
 
-    if not args.no_stabilize:
-        stabilize_server(conn, args.size_mb, fsync_off=not args.keep_fsync)
+    workroot = Path(args.workdir or tempfile.mkdtemp(prefix="pgfanout-bench-"))
+    workroot.mkdir(parents=True, exist_ok=True)
+    empty_config = workroot / "empty.toml"
+    empty_config.write_text("")
+
+    originals = read_overrides(conn) if not args.no_stabilize else {}
+    touched: list[str] = []
+    try:
+        if not args.no_stabilize:
+            stabilize_server(conn, args.size_mb, not args.keep_fsync, touched)
+        data, results = run_benchmark(args, variants, conn, env, workroot, empty_config)
+    finally:
+        # Runs on success, failure and Ctrl-C alike, and must not hide the
+        # original error if cleanup itself fails.
+        for label, step in (
+            ("drop databases", lambda: drop_databases(conn)),
+            ("restore server settings", lambda: restore_server(conn, originals, touched)),
+        ):
+            try:
+                step()
+            except BaseException as exc:  # noqa: BLE001
+                print(f"warning: could not {label}: {exc}", file=sys.stderr)
+        if not args.workdir:
+            shutil.rmtree(workroot, ignore_errors=True)
+
+    meta = {
+        "size_mb_requested": args.size_mb,
+        "repeats": args.repeats,
+        "warmup": args.warmup,
+        "stabilized": not args.no_stabilize,
+        "fsync_off": not args.no_stabilize and not args.keep_fsync,
+        "jobs": args.jobs,
+        "cpus": os.cpu_count(),
+        "cpu_info": cpu_info(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "server_version": psql(conn, "postgres", "SHOW server_version"),
+        **data,
+    }
+    for r in results.values():
+        r["dump_median_s"] = round(statistics.median(r["dump_s"]), 3)
+        r["restore_median_s"] = round(statistics.median(r["restore_s"]), 3)
+    Path(args.out).write_text(json.dumps({"meta": meta, "results": results}, indent=2) + "\n")
+    print(f"Wrote {args.out}")
+
+
+def drop_databases(conn: dict[str, str]) -> None:
+    psql(conn, "postgres", f"DROP DATABASE IF EXISTS {DST_DB}")
+    psql(conn, "postgres", f"DROP DATABASE IF EXISTS {SRC_DB}")
+
+
+def run_benchmark(args, variants, conn, env, workroot: Path, empty_config: Path):
     print(f"Generating ~{args.size_mb} MB dataset ...", flush=True)
     gen_start = time.perf_counter()
     data = generate_dataset(conn, args.size_mb)
@@ -306,12 +408,9 @@ def main() -> None:
         flush=True,
     )
 
-    workroot = Path(args.workdir or tempfile.mkdtemp(prefix="pgfanout-bench-"))
-    workroot.mkdir(parents=True, exist_ok=True)
     results: dict[str, dict] = {
         n: {"dump_s": [], "restore_s": [], "dump_bytes": None} for n, _, _ in variants
     }
-
     for rnd in range(-args.warmup, args.repeats):
         # Rotate the order each round so no variant always runs first (warm cache).
         shift = rnd % len(variants)
@@ -321,7 +420,7 @@ def main() -> None:
             shutil.rmtree(out, ignore_errors=True)
             if kind == "pgfanout":
                 out.mkdir()
-                dump_cmd, restore_cmd = pgfanout_cmds(arg, conn, args.jobs, out)
+                dump_cmd, restore_cmd = pgfanout_cmds(arg, conn, args.jobs, out, empty_config)
             else:
                 dump_cmd, restore_cmd = pgdump_cmds(conn, args.jobs, out)
 
@@ -346,33 +445,7 @@ def main() -> None:
                 f"{label:>11} {name:>10}: dump {dump_s:6.1f}s  restore {restore_s:6.1f}s",
                 flush=True,
             )
-
-    psql(conn, "postgres", f"DROP DATABASE IF EXISTS {DST_DB}")
-    psql(conn, "postgres", f"DROP DATABASE IF EXISTS {SRC_DB}")
-    if not args.no_stabilize:
-        restore_server(conn)
-    if not args.workdir:
-        shutil.rmtree(workroot, ignore_errors=True)
-
-    meta = {
-        "size_mb_requested": args.size_mb,
-        "repeats": args.repeats,
-        "warmup": args.warmup,
-        "stabilized": not args.no_stabilize,
-        "fsync_off": not args.no_stabilize and not args.keep_fsync,
-        "jobs": args.jobs,
-        "cpus": os.cpu_count(),
-        "cpu_info": cpu_info(),
-        "platform": platform.platform(),
-        "python": platform.python_version(),
-        "server_version": psql(conn, "postgres", "SHOW server_version"),
-        **data,
-    }
-    for r in results.values():
-        r["dump_median_s"] = round(statistics.median(r["dump_s"]), 3)
-        r["restore_median_s"] = round(statistics.median(r["restore_s"]), 3)
-    Path(args.out).write_text(json.dumps({"meta": meta, "results": results}, indent=2) + "\n")
-    print(f"Wrote {args.out}")
+    return data, results
 
 
 if __name__ == "__main__":
