@@ -18,8 +18,10 @@ there is nothing vendor-specific in it. Data bytes flow from Postgres
 through a `psql` subprocess and a pipe into the storage sink (local file
 or S3 multipart upload), chunk by chunk, so a 1 TB table does not need
 1 TB of local disk. Python runs the *control* plane (snapshot export,
-catalog discovery, SIGINT cancellation via `psycopg`) and stays off the
-data path; see [Architecture at a glance](#architecture-at-a-glance).
+catalog discovery, SIGINT cancellation via `psycopg`). For local files it
+stays off the data path entirely; for S3 it relays each chunk so it can
+be sent as a multipart upload. See
+[Architecture at a glance](#architecture-at-a-glance).
 
 ## Contents
 
@@ -77,7 +79,8 @@ COPY parsing across parallel workers.
 | Control | `psycopg` in Python | snapshot export/hold, catalog queries (schemas, tables, matviews), `pg_relation_size` for page-range planning, `cancel_safe()` on SIGINT |
 | Data    | `psql` subprocess   | COPY TO STDOUT / COPY FROM STDIN for every data part; `pg_dump` / `pg_restore` for DDL and index rebuilds |
 
-Python code never touches the payload bytes in the COPY path.
+For local files, Python never touches the payload bytes in the COPY
+path; for S3 it relays them chunk by chunk (see the second path below).
 `pgfanout.common.stream_subprocess_to_sink` (dump) and
 `pgfanout.common.stream_source_to_subprocess` (restore) connect the `psql`
 subprocess to the `Blob` via one of two paths, picked automatically
@@ -348,10 +351,14 @@ Test layout:
 
 `test_s3_connectivity.py` is a standalone script, not a unit test. It is
 excluded from pytest discovery via `conftest.py::collect_ignore` and needs
-real credentials and a real S3 endpoint. It confirms the bucket is
-reachable, reading `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-`S3_BUCKET`, and the optional endpoint/TLS/region variables from the
-environment.
+real credentials and a real S3 endpoint. It reads `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `S3_BUCKET`, and the optional endpoint/TLS/region
+variables from the environment.
+
+It is **not read-only**: it uploads, downloads and then deletes an object at
+`S3_TEST_KEY` (default `backup-test/connectivity-test.txt`). An existing
+object at that key is overwritten and then deleted, so point `S3_TEST_KEY`
+at an unused key before running it against a bucket that holds real data.
 
 ## License
 
