@@ -327,21 +327,3 @@ real credentials and a real S3 endpoint:
   `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_BUCKET`, and the
   optional endpoint/TLS/region vars from the environment — never hard-code
   credentials in source)
-
-## Provenance
-
-Extracted from the `backup/` component of an internal PostgreSQL fork,
-with the vendor-specific pieces removed so it stands alone against any
-PostgreSQL server. The changes made during extraction were:
-
-* dropped the fork's framing and the internal container registry in the
-  `Dockerfile` in favour of the public `postgres:17-bookworm` image
-* renamed the config search path to `~/.config/pg-parallel-backup/`
-* made the `tomli` fallback real, so `--config` works on Python 3.10 and
-  earlier instead of only advertising a backport it never imported
-* split test-only dependencies into `requirements-dev.txt`, shared by CI
-  and `tests/run_local.py`
-* added GitHub Actions CI, and made the tree clean under `ruff check`
-  rather than auto-fixing it on every push
-
-No functional change was made to the dump or restore logic.
