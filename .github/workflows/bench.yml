@@ -1,12 +1,40 @@
 name: Benchmark
 
-# Compares a pull request against its base branch on the same runner, in
-# the same job, with the runs interleaved, so machine noise affects both
-# sides equally. It is advisory by default: it posts a table to the job
-# summary and fails only when "enforce" is turned on.
+# Compares a pull request against its base branch for dump and restore speed.
 #
-# There is deliberately no schedule trigger; it runs on pull requests that
-# touch the code, and on demand.
+# What it does
+#   Builds the base branch and the PR into separate virtualenvs and runs
+#   bench/bench.py on both in one job, against one PostgreSQL service
+#   container, together with pg_dump/pg_restore as a reference. Rounds are
+#   interleaved with the order rotated, and a warm-up round is discarded, so
+#   noise on the shared runner hits every variant equally. bench/compare.py
+#   writes a table to the job summary and flags a PR that is slower than the
+#   base by more than 10% (and by more than 0.2s) on the median of 5 rounds.
+#
+# Why it can be trusted, and where it cannot
+#   * It is built to catch regressions, not to produce absolute numbers. The
+#     harness tunes the server for repeatability: it raises max_wal_size and
+#     checkpoint_timeout (a restore writes about as much WAL as it loads, and
+#     a checkpoint part-way through was the main source of restore noise),
+#     runs CHECKPOINT + sync before every timed command, and turns fsync off
+#     so the result does not depend on the runner's disk. All of it is reset
+#     afterwards. Do not publish numbers from this job; use bench.py with
+#     --keep-fsync on a dedicated machine for those.
+#   * Measured on identical code (this workflow compares identical builds
+#     whenever a PR does not touch src/), base and PR differed by at most
+#     3.1% on dump and 1.0% on restore over several runs. Absolute times move
+#     by 15% or more between jobs because each job lands on a different VM,
+#     which is why only the in-job comparison means anything.
+#   * Server and clients share the runner's 4 vCPUs, which are 2 physical
+#     cores with 2 hyper-threads each. A worker costs about 1.4 cores (server
+#     backend plus psql), so the speedup here is capped well below the number
+#     of workers and says little about scaling on a dedicated database host.
+#   * The dataset is one plain 795 MB table with no indexes, so it does not
+#     exercise index builds or many-table parallelism.
+#
+# It is advisory by default: it fails only when "enforce" is turned on
+# (workflow_dispatch). There is deliberately no schedule trigger; it runs on
+# pull requests that touch the code, and on demand.
 on:
   pull_request:
     paths:
