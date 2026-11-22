@@ -23,9 +23,11 @@ name: Benchmark
 #     --keep-fsync on a dedicated machine for those.
 #   * Measured on identical code (this workflow compares identical builds
 #     whenever a PR does not touch src/), base and PR differed by at most
-#     3.1% on dump and 1.0% on restore over several runs. Absolute times move
+#     4.4% on dump and 1.0% on restore over six runs. Absolute times move
 #     by 15% or more between jobs because each job lands on a different VM,
-#     which is why only the in-job comparison means anything.
+#     which is why only the in-job comparison means anything. The 10%
+#     threshold therefore leaves about a 2x margin on dump, so treat a single
+#     flagged dump result as "re-run" before treating it as a regression.
 #   * Server and clients share the runner's 4 vCPUs, which are 2 physical
 #     cores with 2 hyper-threads each. A worker costs about 1.4 cores (server
 #     backend plus psql), so the speedup here is capped well below the number
