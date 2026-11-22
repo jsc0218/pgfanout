@@ -7,7 +7,7 @@ exists" triplets (re-applying globals against a DB that already has
 them) or a genuine failure that must abort the restore.
 """
 
-from parallel_restore import _classify_pg_restore_stderr
+from pgfanout.parallel_restore import _classify_pg_restore_stderr
 
 
 def test_empty_stderr_returns_empty():

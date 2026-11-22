@@ -13,7 +13,7 @@ from unittest import mock
 import psycopg
 import pytest
 
-import parallel_dump as pd
+from pgfanout import parallel_dump as pd
 
 
 class _FakeCursor:
@@ -125,7 +125,7 @@ def test_close_holder_unregisters_even_when_commit_fails():
     otherwise a stale reference leaks and cancel_workers() would try to
     cancel a dead connection forever.
     """
-    import common
+    from pgfanout import common
 
     def raise_err(_sql):
         raise psycopg.OperationalError("connection already closed")

@@ -41,7 +41,7 @@ from pg_test_helpers import (
     run,
 )
 
-from common import (
+from pgfanout.common import (
     GLOBAL_POST_DATA_FILENAME,
     GLOBAL_PRE_DATA_FILENAME,
     MATVIEW_MARKER_FILENAME,
@@ -68,15 +68,12 @@ def get_row_count(table: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _script(name: str) -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "src", name)
-
-
 def run_parallel_dump(output_dir: str, num_parts: int, table: str = TABLE) -> None:
     run(
         [
             sys.executable,
-            _script("parallel_dump.py"),
+            "-m",
+            "pgfanout.parallel_dump",
             "--host",
             PGHOST,
             "--port",
@@ -107,7 +104,8 @@ def run_parallel_restore(
 ) -> None:
     cmd = [
         sys.executable,
-        _script("parallel_restore.py"),
+        "-m",
+        "pgfanout.parallel_restore",
         "--host",
         PGHOST,
         "--port",
@@ -136,7 +134,8 @@ def run_db_dump(output_dir: str, num_parts: int) -> None:
     run(
         [
             sys.executable,
-            _script("parallel_dump.py"),
+            "-m",
+            "pgfanout.parallel_dump",
             "--host",
             PGHOST,
             "--port",
@@ -158,7 +157,8 @@ def run_db_dump(output_dir: str, num_parts: int) -> None:
 def run_db_restore(input_dir: str, index_jobs: int = 1, unlogged: bool = False) -> None:
     cmd = [
         sys.executable,
-        _script("parallel_restore.py"),
+        "-m",
+        "pgfanout.parallel_restore",
         "--host",
         PGHOST,
         "--port",
@@ -427,7 +427,8 @@ def test_restore_retry_on_corrupt_part(tmp_path):
     result = subprocess.run(
         [
             sys.executable,
-            _script("parallel_restore.py"),
+            "-m",
+            "pgfanout.parallel_restore",
             "--host",
             PGHOST,
             "--port",
@@ -540,7 +541,8 @@ def test_config_file_dump_restore(tmp_path):
     run(
         [
             sys.executable,
-            _script("parallel_dump.py"),
+            "-m",
+            "pgfanout.parallel_dump",
             "--config",
             config_path,
             "--table",
@@ -554,7 +556,8 @@ def test_config_file_dump_restore(tmp_path):
     run(
         [
             sys.executable,
-            _script("parallel_restore.py"),
+            "-m",
+            "pgfanout.parallel_restore",
             "--config",
             config_path,
             "--table",
@@ -1067,7 +1070,8 @@ def test_dump_retry_on_write_failure(tmp_path):
     result = subprocess.run(
         [
             sys.executable,
-            _script("parallel_dump.py"),
+            "-m",
+            "pgfanout.parallel_dump",
             "--host",
             PGHOST,
             "--port",
@@ -1238,7 +1242,8 @@ def test_special_char_table_names(tmp_path):
         run(
             [
                 sys.executable,
-                _script("parallel_dump.py"),
+                "-m",
+                "pgfanout.parallel_dump",
                 "--host",
                 PGHOST,
                 "--port",
@@ -1265,7 +1270,8 @@ def test_special_char_table_names(tmp_path):
         run(
             [
                 sys.executable,
-                _script("parallel_restore.py"),
+                "-m",
+                "pgfanout.parallel_restore",
                 "--host",
                 PGHOST,
                 "--port",
@@ -1485,7 +1491,8 @@ def test_config_password_env(tmp_path):
     subprocess.run(
         [
             sys.executable,
-            _script("parallel_dump.py"),
+            "-m",
+            "pgfanout.parallel_dump",
             "--config",
             config_path,
             "--table",
@@ -1520,7 +1527,8 @@ def test_json_logging_output(tmp_path):
     result = subprocess.run(
         [
             sys.executable,
-            _script("parallel_dump.py"),
+            "-m",
+            "pgfanout.parallel_dump",
             "--host",
             PGHOST,
             "--port",

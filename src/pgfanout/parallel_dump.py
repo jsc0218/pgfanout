@@ -76,7 +76,7 @@ Parameters:
                --retries       (max retries for failed parts; default: 0)
 
 Single-table mode (explicit --table):
-    python3 src/parallel_dump.py \\
+    pgfanout-dump \\
         --host HOST --user USER --password PASS \\
         --database mydb --table mytable --num-parts 4 \\
         --output-dir s3://my-bucket/dumps/mydb/mytable
@@ -84,7 +84,7 @@ Single-table mode (explicit --table):
     Part files land directly under --output-dir.
 
 Database-level mode (omit --table):
-    python3 src/parallel_dump.py \\
+    pgfanout-dump \\
         --host HOST --user USER --password PASS \\
         --database mydb --num-parts 4 \\
         --output-dir s3://my-bucket/dumps/mydb
@@ -105,7 +105,7 @@ import time
 
 import psycopg
 
-from common import (
+from .common import (
     GLOBAL_POST_DATA_FILENAME,
     GLOBAL_PRE_DATA_FILENAME,
     LOG,
@@ -137,9 +137,9 @@ from common import (
     unregister_conn,
     validate_connection_args,
 )
-from storage import Blob, is_s3_uri, make_blob
-from storage import join as storage_join
-from storage import makedirs as storage_makedirs
+from .storage import Blob, is_s3_uri, make_blob
+from .storage import join as storage_join
+from .storage import makedirs as storage_makedirs
 
 # pg_export_snapshot() returns IDs like "0000025E-00000002-1" (hex-hex-decimal).
 SNAPSHOT_ID_RE = re.compile(r"^[0-9A-Fa-f]+-[0-9A-Fa-f]+-\d+$")

@@ -4,11 +4,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --break-system-packages -r /app/requirements.txt
+COPY pyproject.toml README.md LICENSE NOTICE /build/
+COPY src/ /build/src/
+RUN pip install --no-cache-dir --break-system-packages /build \
+    && rm -rf /build
 
-COPY src/ /app/
-
-WORKDIR /app
-
-ENTRYPOINT ["python3"]
+# Run the tools directly, e.g. `docker run IMAGE pgfanout-dump --help`.
+ENTRYPOINT []

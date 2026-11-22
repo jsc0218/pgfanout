@@ -1,12 +1,6 @@
 """Pytest configuration and shared fixtures for backup tests."""
 
-import os
-import sys
-
 import pytest
-
-# Make src importable for all test modules in this directory.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 # Standalone scripts that happen to start with test_ but require external
 # services (real S3 endpoint + credentials) and should not run under pytest.

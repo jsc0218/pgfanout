@@ -12,8 +12,8 @@ These tests stub :func:`parallel_restore.restore_table_post_data` so
 they don't require a live Postgres or filesystem layout.
 """
 
-import parallel_restore
-from common import ConnInfo
+from pgfanout import parallel_restore
+from pgfanout.common import ConnInfo
 
 
 def _stub_conn() -> ConnInfo:

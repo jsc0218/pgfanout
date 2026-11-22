@@ -1,4 +1,4 @@
-"""Unit tests for src/common.py helpers.
+"""Unit tests for src/pgfanout/common.py helpers.
 
 Pure-Python tests — no live Postgres required.
 """
@@ -10,7 +10,7 @@ import tempfile
 
 import pytest
 
-from common import (
+from pgfanout.common import (
     ConnInfo,
     _active_procs,
     _format_psql_row,
