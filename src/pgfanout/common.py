@@ -1108,8 +1108,8 @@ def add_connection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config",
         default=None,
-        help="Optional. Path to backup.toml config file.  "
-        "Auto-detected from ./backup.toml or ~/.config/pg-parallel-backup/backup.toml.",
+        help="Optional. Path to pgfanout.toml config file.  "
+        "Auto-detected from ./pgfanout.toml or ~/.config/pgfanout/pgfanout.toml.",
     )
     parser.add_argument("--host", default=None, help="PostgreSQL hostname")
     parser.add_argument("--port", default=None, help="PostgreSQL port (default: 5432)")
@@ -1135,8 +1135,8 @@ def add_connection_args(parser: argparse.ArgumentParser) -> None:
 # ---------------------------------------------------------------------------
 
 _CONFIG_SEARCH_PATHS = [
-    "./backup.toml",
-    os.path.expanduser("~/.config/pg-parallel-backup/backup.toml"),
+    "./pgfanout.toml",
+    os.path.expanduser("~/.config/pgfanout/pgfanout.toml"),
 ]
 
 
@@ -1146,8 +1146,8 @@ def load_config(config_path: str | None) -> dict:
     Search order (first match wins):
 
     1. Explicit ``--config <path>`` (error if not found)
-    2. ``./backup.toml`` in the current working directory
-    3. ``~/.config/pg-parallel-backup/backup.toml``
+    2. ``./pgfanout.toml`` in the current working directory
+    3. ``~/.config/pgfanout/pgfanout.toml``
 
     Returns an empty dict when no config file is found or ``tomllib``
     is not available (Python < 3.11).
@@ -1271,7 +1271,7 @@ def validate_connection_args(args: argparse.Namespace) -> None:
     if missing:
         LOG.error(
             "ERROR: Missing required connection parameters: %s\n"
-            "Provide via CLI flags or a backup.toml config file (see --config).",
+            "Provide via CLI flags or a pgfanout.toml config file (see --config).",
             ", ".join(missing),
         )
         sys.exit(1)

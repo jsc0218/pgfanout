@@ -1256,7 +1256,7 @@ def main() -> None:
     validate_connection_args(args)
 
     if args.input_dir is None:
-        LOG.error("ERROR: --input-dir is required (or set restore.input_dir in backup.toml).")
+        LOG.error("ERROR: --input-dir is required (or set restore.input_dir in pgfanout.toml).")
         sys.exit(1)
     if args.index_jobs is None:
         args.index_jobs = 1

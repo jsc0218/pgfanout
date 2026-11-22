@@ -7,5 +7,5 @@ venv/
 *.egg-info/
 
 # Local dump output and config
-backup.toml
+pgfanout.toml
 *.bin

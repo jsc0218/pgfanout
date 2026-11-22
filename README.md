@@ -278,9 +278,9 @@ pgfanout-dump ... --output-dir s3://rdb-poc/backups/mydb
 
 CLI flags can be defaulted from a TOML config.  Load order (first match wins):
 
-1. `--config /path/to/backup.toml`
-2. `./backup.toml`
-3. `~/.config/pg-parallel-backup/backup.toml`
+1. `--config /path/to/pgfanout.toml`
+2. `./pgfanout.toml`
+3. `~/.config/pgfanout/pgfanout.toml`
 
 CLI flags always override config values.
 
