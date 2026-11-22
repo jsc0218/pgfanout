@@ -95,32 +95,11 @@ COPY parsing across parallel workers.
 | Data    | `psql` subprocess   | COPY TO STDOUT / COPY FROM STDIN for every data part; `pg_dump` / `pg_restore` for DDL and index rebuilds |
 
 For local files, Python never touches the payload bytes in the COPY
-path; for S3 it relays them chunk by chunk (see the second path below).
-`pgfanout.common.stream_subprocess_to_sink` (dump) and
-`pgfanout.common.stream_source_to_subprocess` (restore) connect the `psql`
-subprocess to the `Blob` via one of two paths, picked automatically
-per-call based on the destination type:
-
-* **OS-direct fast-path** — when the `Blob` exposes a real OS file
-  descriptor (every `LocalBlob`), the helpers hand the fd straight to `subprocess.Popen` as
-  `stdout=` (dump) or `stdin=` (restore).  Popen calls `dup2(fd, 1/0)`
-  in the child, so the subprocess writes to (or reads from) the file
-  via its own libc `write()` / `read()` syscalls — *zero* Python in
-  the data path of our process, no GIL traffic from the streaming
-  step.  N parallel workers therefore do not contend on the GIL.  A small daemon thread polls `os.fstat(fd).st_size` once a
-  second to feed live progress into the shared `bytes_written` dict
-  that `progress_monitor` consumes.
-* **Python read/write fallback** — when the `Blob` is a Python class
-  (`_S3MultipartWriter`, `_S3StreamReader`) the bytes have to traverse
-  Python so multipart upload buffers can chunk them.  The familiar
-  `while True: chunk = read(); write(chunk)` loop pumps the data with
-  per-chunk `bytes_callback` updates.  This is
-  also the path used by tests that hand in `io.BytesIO`.
-
-Either way the subprocess stays registered in the cancel registry, a
-dedicated thread drains stderr so warnings can't deadlock the
-pipeline, and a non-zero exit surfaces as `CalledProcessError` with
-the captured stderr attached.
+path: `psql` writes (or reads) the file directly. For S3 it relays them chunk
+by chunk so they can be sent as a multipart upload. The two paths, and what
+the two helpers `stream_subprocess_to_sink` / `stream_source_to_subprocess`
+do for cancellation and error handling, are described in
+[docs/architecture.md](docs/architecture.md).
 
 ### Storage abstraction
 
@@ -264,30 +243,9 @@ and out of `ps` output.
 Credentials are also read from `~/.aws/credentials` if not set
 explicitly — boto3's default chain applies.
 
-### Ceph RGW example
-
-```bash
-export AWS_ENDPOINT_URL_S3=https://object-store-cluster.example.com:7483
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_S3_VERIFY_SSL=false       # self-signed certificate
-export AWS_REGION=us-east-1          # Ceph is region-agnostic, but boto3 wants a value
-
-pgfanout-dump ... --output-dir s3://rdb-poc/backups/mydb
-```
-
-### Multipart semantics
-
-* Upload: `_S3MultipartWriter` streams data in fixed-size chunks
-  (default 16 MiB, minimum 5 MiB per S3 spec) and completes the
-  multipart upload on close.  The final part may be smaller than the
-  chunk size.  An empty object is written with a plain `PutObject`,
-  because S3 rejects a multipart upload with zero parts.
-* Download / restore: `S3Blob.open_read()` returns a boto3
-  `StreamingBody` that supports chunked `read()` — no full-object
-  materialization in memory.
-* Failure mode: any exception in the writer aborts the multipart
-  upload, preventing orphaned parts from accumulating cost.
+The multipart upload parts are 16 MiB (5 MiB is the S3 minimum) and a failed
+upload is aborted so no orphaned parts are billed; see
+`src/pgfanout/storage.py`.
 
 ## 📝 Config file
 
@@ -325,55 +283,13 @@ retries = 1
 
 ## 🧪 Running the tests
 
-The easiest way is the Docker runner, which brings up a Postgres
-container, installs the dependencies, and runs pytest inside:
-
 ```bash
-python3 tests/run_local.py
+python3 tests/run_local.py      # starts a Postgres container and runs pytest in it
 ```
 
-Against a Postgres you already have running, install the test
-dependencies and point the standard libpq environment variables at it.
-The client tools on your `PATH` must be the same major version as the
-server, since `pg_dump` refuses to talk to a newer one:
-
-```bash
-pip install -r requirements-dev.txt
-
-export PGHOST=localhost PGPORT=5432 PGUSER=postgres PGPASSWORD=postgres
-cd tests && python3 -m pytest -v
-```
-
-`PGPASSWORD` has to be non-empty even against a `trust` server, because
-the tools require `--password` to be supplied.
-
-CI runs this on every push against PostgreSQL 14 through 18 service
-containers, plus `ruff format --check`, `ruff check`, and a package
-build check. See `.github/workflows/ci.yml`.
-
-Test layout:
-
-| File                              | What it covers                                                        |
-|-----------------------------------|-----------------------------------------------------------------------|
-| `test_common.py`                  | `ConnInfo`, `psql_query/exec`, `stream_subprocess_to_sink`, `stream_source_to_subprocess`, `_real_fd` / OS-direct fast-path |
-| `test_cancel.py`                  | SIGINT-driven subprocess + connection cancellation, `tracked_connection` semantics |
-| `test_snapshot.py`                | `export_snapshot`, snapshot-holder watchdog, dump-side progress monitor |
-| `test_storage.py`                 | `LocalBlob`, `S3Blob` (via `botocore.stub.Stubber`), multipart upload, `localize`, scheme-aware path helpers |
-| `test_pg_restore_stderr.py`       | Classification of `pg_restore` stderr — benign "already exists" triplets vs. real failures |
-| `test_phase_orchestration.py`     | Database-level restore phases forward `--index-jobs` to pg_restore (regression guard for serial FK validation) |
-| `test_parallel_backup.py`         | End-to-end dump + restore round-trip on local disk                    |
-| `test_parallel_backup_s3.py`      | End-to-end dump + restore round-trip on S3 (via `moto.server`)        |
-
-`test_s3_connectivity.py` is a standalone script, not a unit test. It is
-excluded from pytest discovery via `conftest.py::collect_ignore` and needs
-real credentials and a real S3 endpoint. It reads `AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`, `S3_BUCKET`, and the optional endpoint/TLS/region
-variables from the environment.
-
-It is **not read-only**: it uploads, downloads and then deletes an object at
-`S3_TEST_KEY` (default `backup-test/connectivity-test.txt`). An existing
-object at that key is overwritten and then deleted, so point `S3_TEST_KEY`
-at an unused key before running it against a bucket that holds real data.
+or `cd tests && python3 -m pytest -v` against a Postgres you already have
+running. The setup details and the test layout are in
+[tests/README.md](tests/README.md).
 
 ## 📄 License
 
