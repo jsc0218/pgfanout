@@ -1,41 +1,56 @@
 # pgfanout
 
+<p align="center"><b>Parallel logical dump and restore for PostgreSQL, streaming straight to S3 or local disk.</b></p>
+
 [![CI](https://github.com/jsc0218/pgfanout/actions/workflows/ci.yml/badge.svg)](https://github.com/jsc0218/pgfanout/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/pgfanout.svg)](https://pypi.org/project/pgfanout/)
-[![Python](https://img.shields.io/pypi/pyversions/pgfanout.svg)](https://pypi.org/project/pgfanout/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14%20%7C%2015%20%7C%2016%20%7C%2017%20%7C%2018-336791.svg)](#install)
+[![PyPI](https://img.shields.io/pypi/v/pgfanout.svg?logo=pypi&logoColor=white)](https://pypi.org/project/pgfanout/)
+[![Python](https://img.shields.io/pypi/pyversions/pgfanout.svg?logo=python&logoColor=white)](https://pypi.org/project/pgfanout/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14%20%7C%2015%20%7C%2016%20%7C%2017%20%7C%2018-336791.svg?logo=postgresql&logoColor=white)](#-install)
+[![S3](https://img.shields.io/badge/S3-compatible-569A31.svg?logo=amazons3&logoColor=white)](#-s3-configuration)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/jsc0218/pgfanout/blob/main/LICENSE)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Stars](https://img.shields.io/github/stars/jsc0218/pgfanout?logo=github)](https://github.com/jsc0218/pgfanout/stargazers)
+[![Last commit](https://img.shields.io/github/last-commit/jsc0218/pgfanout?logo=git&logoColor=white)](https://github.com/jsc0218/pgfanout/commits/main)
+[![Issues](https://img.shields.io/github/issues/jsc0218/pgfanout?logo=github)](https://github.com/jsc0218/pgfanout/issues)
 
-Parallel logical dump and restore for PostgreSQL. `pgfanout-dump` and
-`pgfanout-restore` replace `pg_dump` / `pg_restore`: they split a single
-table across parallel page-range workers under one consistent snapshot,
-rebuild indexes in parallel on restore, and stream table data straight
-to **local disk or S3-compatible object storage**, with no staging copy
-of the data and no server-side file privileges.
+`pgfanout-dump` and `pgfanout-restore` replace `pg_dump` / `pg_restore`
+for logical backups of a PostgreSQL database.
 
-It works against any PostgreSQL server you can reach over libpq, and
-there is nothing vendor-specific in it. Data bytes flow from Postgres
-through a `psql` subprocess and a pipe into the storage sink (local file
-or S3 multipart upload), chunk by chunk, so a 1 TB table does not need
-1 TB of local disk. Python runs the *control* plane (snapshot export,
-catalog discovery, SIGINT cancellation via `psycopg`). For local files it
-stays off the data path entirely; for S3 it relays each chunk so it can
-be sent as a multipart upload. See
-[Architecture at a glance](#architecture-at-a-glance).
+## ✨ Highlights
 
-## Contents
+* ⚡ **Parallel inside a single table.** One table is split across page-range
+  workers (`ctid` scans), all under one consistent snapshot.
+* ☁️ **Straight to S3 or local disk.** Table data is streamed, never staged:
+  no local copy of the dump and no server-side file privileges.
+* 🔁 **Parallel index rebuild** on restore (`--index-jobs`), with the load
+  phases laid out explicitly: data, indexes, FKs, sequences, matviews.
+* 🐍 **Python on the control plane.** Snapshot export, catalog discovery,
+  cancellation and retries are Python; the bytes flow through native tools.
+* 🔌 **Any PostgreSQL 14+ you can reach over libpq.** Nothing vendor-specific.
+* 📊 **Benchmarked in CI.** Every PR is compared against `main` on the same
+  runner (see [Benchmarks](#-benchmarks)).
 
-- [When to reach for this](#when-to-reach-for-this)
-- [Architecture at a glance](#architecture-at-a-glance)
-- [Install](#install)
-- [Quick start](#quick-start)
-- [CLI reference](#cli-reference)
-- [S3 configuration](#s3-configuration)
-- [Config file](#config-file)
-- [Benchmarks](#benchmarks)
-- [Running the tests](#running-the-tests)
+Data bytes flow from Postgres through a `psql` subprocess and a pipe
+into the storage sink (local file or S3 multipart upload), chunk by
+chunk, so a 1 TB table does not need 1 TB of local disk. Python runs the
+*control* plane (snapshot export, catalog discovery, SIGINT cancellation
+via `psycopg`). For local files it stays off the data path entirely; for
+S3 it relays each chunk so it can be sent as a multipart upload. See
+[Architecture at a glance](#-architecture-at-a-glance).
 
-## When to reach for this
+## 📚 Contents
+
+- [When to reach for this](#-when-to-reach-for-this)
+- [Architecture at a glance](#-architecture-at-a-glance)
+- [Install](#-install)
+- [Quick start](#-quick-start)
+- [CLI reference](#-cli-reference)
+- [S3 configuration](#-s3-configuration)
+- [Config file](#-config-file)
+- [Benchmarks](#-benchmarks)
+- [Running the tests](#-running-the-tests)
+
+## 🎯 When to reach for this
 
 Use this tool when the builtin `pg_dump -Fd -j N` / `pg_restore -j N` is
 too slow or does not fit your operational constraints:
@@ -54,7 +69,7 @@ too slow or does not fit your operational constraints:
   bandwidth and then rebuild indexes in parallel at the end
   (`--index-jobs`).
 
-## Architecture at a glance
+## 🧩 Architecture at a glance
 
 ```
 pgfanout-dump                     pgfanout-restore
@@ -123,7 +138,7 @@ real on-disk path (`psql -f`, `pg_restore`): local blobs are zero-copy,
 S3 blobs are streamed to a `tempfile.NamedTemporaryFile` that is
 cleaned up even on exceptions.
 
-## Install
+## 📦 Install
 
 ```bash
 pip install pgfanout
@@ -139,7 +154,7 @@ Requirements:
   `PATH`, with the same major version as the server, because `pg_dump`
   refuses to talk to a newer server.
 
-## Quick start
+## 🚀 Quick start
 
 ### Local disk
 
@@ -162,7 +177,7 @@ pgfanout-restore \
 ### S3-compatible object storage
 
 Point `--output-dir` / `--input-dir` at an `s3://` URI and set the AWS
-env vars (see [S3 configuration](#s3-configuration)):
+env vars (see [S3 configuration](#-s3-configuration)):
 
 ```bash
 export AWS_ENDPOINT_URL_S3=https://ceph-rgw.example.com:7483
@@ -183,7 +198,7 @@ pgfanout-restore \
     --input-dir s3://my-bucket/dumps/mydb
 ```
 
-## CLI reference
+## 🔧 CLI reference
 
 ### Shared options (dump + restore)
 
@@ -194,7 +209,7 @@ pgfanout-restore \
 | `--user`        | ✓        |         | DB user with SELECT (dump) / CREATE (restore) |
 | `--password`    | ✓        |         | Or via `password_env = "PGPASSWORD"` in config |
 | `--database`    | ✓        |         |                                               |
-| `--config PATH` |          | auto    | TOML file; see [Config file](#config-file)    |
+| `--config PATH` |          | auto    | TOML file; see [Config file](#-config-file)    |
 | `--retries N`   |          | `0`     | Per-part retry budget on transient errors     |
 | `--log-format`  |          | `text`  | `text` or `json`                              |
 | `--log-level`   |          | `info`  | `debug`, `info`, `warning` or `error`         |
@@ -230,7 +245,7 @@ The restore is idempotent within a database: each invocation drops and
 recreates its tables before loading. In database-level mode the drop uses
 `CASCADE`, so objects that depend on those tables are dropped too.
 
-## S3 configuration
+## 🪣 S3 configuration
 
 All S3 configuration flows through standard AWS environment variables,
 resolved inside `src/pgfanout/storage.py::make_s3_client`.  No flags or
@@ -275,7 +290,7 @@ pgfanout-dump ... --output-dir s3://rdb-poc/backups/mydb
 * Failure mode: any exception in the writer aborts the multipart
   upload, preventing orphaned parts from accumulating cost.
 
-## Config file
+## 📝 Config file
 
 CLI flags can be defaulted from a TOML config.  Load order (first match wins):
 
@@ -309,7 +324,7 @@ unlogged = false
 retries = 1
 ```
 
-## Benchmarks
+## 📊 Benchmarks
 
 `bench/bench.py` generates a deterministic dataset, a single large plain
 table with no indexes (so it measures raw data dump and load speed, not
@@ -348,7 +363,7 @@ fails the job. GitHub-hosted runners are noisy, so it only catches large
 regressions (the default threshold is 20%); use a dedicated machine for
 numbers you intend to publish.
 
-## Running the tests
+## 🧪 Running the tests
 
 The easiest way is the Docker runner, which brings up a Postgres
 container, installs the dependencies, and runs pytest inside:
@@ -400,6 +415,6 @@ It is **not read-only**: it uploads, downloads and then deletes an object at
 object at that key is overwritten and then deleted, so point `S3_TEST_KEY`
 at an unused key before running it against a bucket that holds real data.
 
-## License
+## 📄 License
 
 Apache License 2.0. See [LICENSE](https://github.com/jsc0218/pgfanout/blob/main/LICENSE).
