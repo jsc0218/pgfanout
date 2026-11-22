@@ -364,9 +364,10 @@ the same runner, compares the median times, and writes a table to the job
 summary. It is advisory by default and never runs on a schedule. Start it
 by hand from the Actions tab (**Benchmark → Run workflow**) to choose the
 dataset size, the number of rounds, the threshold, and whether a regression
-fails the job. GitHub-hosted runners are noisy, so it only catches large
-regressions (the default threshold is 20%); use a dedicated machine for
-numbers you intend to publish.
+fails the job. GitHub-hosted runners are noisy, so it only catches
+regressions of about 10% or more (the default threshold, ignoring any
+slowdown under 0.2s); use a dedicated machine for numbers you intend to
+publish.
 
 ## 🧪 Running the tests
 

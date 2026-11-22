@@ -26,8 +26,8 @@ on:
         description: 'Measured rounds per variant'
         default: '5'
       threshold:
-        description: 'Allowed slowdown, as a fraction (0.20 = 20%)'
-        default: '0.20'
+        description: 'Allowed slowdown, as a fraction (0.10 = 10%)'
+        default: '0.10'
       enforce:
         description: 'Fail the job on a regression'
         type: boolean
@@ -68,7 +68,7 @@ jobs:
       BASE: ${{ github.event.pull_request.base.sha || inputs.base_ref }}
       SIZE_MB: ${{ inputs.size_mb || '1024' }}
       REPEATS: ${{ inputs.repeats || '5' }}
-      THRESHOLD: ${{ inputs.threshold || '0.20' }}
+      THRESHOLD: ${{ inputs.threshold || '0.10' }}
       ENFORCE: ${{ inputs.enforce || 'false' }}
 
     steps:
