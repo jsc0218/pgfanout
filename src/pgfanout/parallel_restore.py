@@ -358,14 +358,18 @@ def copy_part(
 
     # qtable comes from qualified_name() which double-quotes both
     # schema and table; no injection risk from string-embedding it.
-    sql_script = f"SET statement_timeout = 0;\nCOPY {qtable} FROM STDIN WITH (FORMAT binary);\n"
+    # Two separate -c options rather than one "SET ...; COPY ..." string: some
+    # psql releases (seen with 17.11) abort a COPY FROM STDIN that follows
+    # another statement in the same -c with "unexpected COPY_IN result".
     cmd = [
         *conn.psql_args(),
         "-q",
         "-v",
         "ON_ERROR_STOP=1",
         "-c",
-        sql_script,
+        "SET statement_timeout = 0",
+        "-c",
+        f"COPY {qtable} FROM STDIN WITH (FORMAT binary)",
     ]
 
     start = time.time()
