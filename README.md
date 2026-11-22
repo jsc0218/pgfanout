@@ -28,7 +28,7 @@ for logical backups of a PostgreSQL database.
   cancellation and retries are Python; the bytes flow through native tools.
 * 🔌 **Any PostgreSQL 14+ you can reach over libpq.** Nothing vendor-specific.
 * 📊 **Benchmarked in CI.** Every PR is compared against `main` on the same
-  runner (see [Benchmarks](#-benchmarks)).
+  runner (see [`bench/`](bench/README.md)).
 
 Data bytes flow from Postgres through a `psql` subprocess and a pipe
 into the storage sink (local file or S3 multipart upload), chunk by
@@ -47,7 +47,6 @@ S3 it relays each chunk so it can be sent as a multipart upload. See
 - [CLI reference](#-cli-reference)
 - [S3 configuration](#-s3-configuration)
 - [Config file](#-config-file)
-- [Benchmarks](#-benchmarks)
 - [Running the tests](#-running-the-tests)
 
 ## 🎯 When to reach for this
@@ -323,33 +322,6 @@ index_jobs = 4
 unlogged = false
 retries = 1
 ```
-
-## 📊 Benchmarks
-
-`bench/bench.py` times dump and restore of a generated single large table
-for each variant you give it (pgfanout builds, or `pg_dump`/`pg_restore` as
-a baseline) and checks the restored row counts. `bench/compare.py` turns the
-JSON into a table and a verdict.
-
-```bash
-export PGHOST=localhost PGPORT=5432 PGUSER=postgres PGPASSWORD=postgres
-python3 bench/bench.py \
-    --variant pr=pgfanout:.venv/bin \
-    --variant pg_dump=pgdump \
-    --size-mb 1024 --repeats 5 --out results.json
-python3 bench/compare.py results.json --base pr --pr pr --reference pg_dump
-```
-
-Use `--variant NAME=pgfanout:BINDIR` once per build to compare two builds,
-for example an installed release and your working tree. By default the
-harness tunes the server for repeatability (checkpoints and `fsync`), which
-makes the numbers fine for catching regressions but not for publishing: see
-`python3 bench/bench.py --help` for `--keep-fsync` and `--no-stabilize`.
-
-The **Benchmark** workflow runs this on pull requests that touch `src/` or
-`bench/`, comparing the base branch with the PR on the same runner, and is
-advisory. How it works and what it can and cannot detect is documented at
-the top of [`.github/workflows/bench.yml`](.github/workflows/bench.yml).
 
 ## 🧪 Running the tests
 
