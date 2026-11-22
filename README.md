@@ -327,6 +327,12 @@ python3 bench/bench.py \
 python3 bench/compare.py results.json --base pr --pr pr --reference pg_dump
 ```
 
+Before each timed command the harness runs `CHECKPOINT` and `sync`, and it
+raises `max_wal_size` and `checkpoint_timeout` for the duration of the run
+(reset at the end), because a restore writes about as much WAL as it loads
+data and a checkpoint landing part-way through is the main source of
+run-to-run noise. Pass `--no-stabilize` to leave the server alone.
+
 The `pg_dump` variant runs `pg_dump -Fd -Z 0 -j N` and `pg_restore -j N`,
 uncompressed so the comparison is like for like. Use `--variant
 NAME=pgfanout:BINDIR` once per build to compare two builds, for example an

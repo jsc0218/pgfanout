@@ -139,6 +139,39 @@ def generate_dataset(conn: dict[str, str], size_mb: int) -> dict:
     return {"row_counts": counts, "source_db_bytes": db_bytes}
 
 
+def settle(conn: dict[str, str]) -> None:
+    """Flush dirty data so a timed run starts from a quiet system.
+
+    A restore writes about as much WAL as it loads data. With the default
+    max_wal_size that triggers a checkpoint part-way through the run, and
+    how much work it has to do depends on whatever the previous run left
+    dirty, which is the main source of run-to-run noise. Checkpointing and
+    syncing right before each timed command removes that carry-over.
+    """
+    psql(conn, "postgres", "CHECKPOINT")
+    os.sync()
+    time.sleep(0.5)
+
+
+def stabilize_server(conn: dict[str, str], size_mb: int) -> None:
+    """Stop WAL-triggered checkpoints from landing inside a timed restore.
+
+    Only touches settings that take effect on reload, and is undone by
+    restore_server() at the end of the run.
+    """
+    wal_mb = max(4096, 4 * size_mb)
+    psql(conn, "postgres", f"ALTER SYSTEM SET max_wal_size = '{wal_mb}MB'")
+    psql(conn, "postgres", "ALTER SYSTEM SET checkpoint_timeout = '1h'")
+    psql(conn, "postgres", "SELECT pg_reload_conf()")
+    time.sleep(1)
+
+
+def restore_server(conn: dict[str, str]) -> None:
+    psql(conn, "postgres", "ALTER SYSTEM RESET max_wal_size")
+    psql(conn, "postgres", "ALTER SYSTEM RESET checkpoint_timeout")
+    psql(conn, "postgres", "SELECT pg_reload_conf()")
+
+
 def verify(conn: dict[str, str], expected: dict[str, int], variant: str) -> None:
     for table, want in expected.items():
         got = int(psql(conn, DST_DB, f"SELECT count(*) FROM {table}"))
@@ -207,6 +240,11 @@ def main() -> None:
         help="unrecorded rounds first, so cold caches do not skew the first variant",
     )
     ap.add_argument("--jobs", type=int, default=4, help="parallel parts / jobs for every tool")
+    ap.add_argument(
+        "--no-stabilize",
+        action="store_true",
+        help="leave server checkpoint settings alone and skip the pre-run checkpoint",
+    )
     ap.add_argument("--workdir", default=None, help="where dumps are written (default: temp dir)")
     ap.add_argument("--out", default="bench-results.json")
     args = ap.parse_args()
@@ -217,6 +255,8 @@ def main() -> None:
     conn = env_conn()
     env = {**os.environ, "PGPASSWORD": conn["password"]}
 
+    if not args.no_stabilize:
+        stabilize_server(conn, args.size_mb)
     print(f"Generating ~{args.size_mb} MB dataset ...", flush=True)
     gen_start = time.perf_counter()
     data = generate_dataset(conn, args.size_mb)
@@ -248,8 +288,12 @@ def main() -> None:
             psql(conn, "postgres", f"DROP DATABASE IF EXISTS {DST_DB}")
             psql(conn, "postgres", f"CREATE DATABASE {DST_DB}")
 
+            if not args.no_stabilize:
+                settle(conn)
             dump_s = run(dump_cmd, env=env)
             results[name]["dump_bytes"] = dir_bytes(out)
+            if not args.no_stabilize:
+                settle(conn)
             restore_s = run(restore_cmd, env=env)
             verify(conn, data["row_counts"], name)
 
@@ -265,6 +309,8 @@ def main() -> None:
 
     psql(conn, "postgres", f"DROP DATABASE IF EXISTS {DST_DB}")
     psql(conn, "postgres", f"DROP DATABASE IF EXISTS {SRC_DB}")
+    if not args.no_stabilize:
+        restore_server(conn)
     if not args.workdir:
         shutil.rmtree(workroot, ignore_errors=True)
 
@@ -272,6 +318,7 @@ def main() -> None:
         "size_mb_requested": args.size_mb,
         "repeats": args.repeats,
         "warmup": args.warmup,
+        "stabilized": not args.no_stabilize,
         "jobs": args.jobs,
         "cpus": os.cpu_count(),
         "platform": platform.platform(),
