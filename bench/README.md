@@ -14,8 +14,15 @@ performance regressions in pull requests.
 
 ## Run it
 
-You need a PostgreSQL server you can create databases on, plus `psql`,
-`pg_dump` and `pg_restore` of the same major version on your `PATH`.
+You need `psql`, `pg_dump` and `pg_restore` of the same major version as the
+server on your `PATH`, and a **disposable** PostgreSQL server, because by
+default the harness changes server-wide settings (see
+[What the numbers mean](#what-the-numbers-mean)). That needs a superuser: it
+reads `pg_file_settings`, runs `ALTER SYSTEM` and reloads the configuration,
+and issues cluster-wide `CHECKPOINT`s. It turns `fsync` off for **every
+database on the server**, and only when the server is on the local machine.
+Do not point it at a shared or production server; use `--no-stabilize` there,
+which only needs permission to create and drop databases.
 
 ```bash
 export PGHOST=localhost PGPORT=5432 PGUSER=postgres PGPASSWORD=postgres
@@ -38,8 +45,10 @@ them to `compare.py` as `--base` and `--pr`. Run `python3 bench/bench.py
 
 By default the harness tunes the server for repeatability: it raises
 `max_wal_size` and `checkpoint_timeout`, runs `CHECKPOINT` and `sync` before
-each timed command, and turns `fsync` off. All of it is reset afterwards, to
-the settings that were there before. That makes the numbers good for
+each timed command, and turns `fsync` off (local servers only). All of it is
+reset afterwards, to the settings that were there before, and the data
+written while `fsync` was off is flushed to disk first, as PostgreSQL
+requires when switching it back on. That makes the numbers good for
 catching regressions between builds and **not suitable for publishing**,
 because they flatter the disk-bound restore phase.
 

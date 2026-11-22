@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import statistics
 import subprocess
@@ -66,6 +67,23 @@ def cpu_info() -> dict[str, object]:
     except (KeyError, ValueError):
         pass
     return info
+
+
+def is_local_host(host: str) -> bool:
+    return host in ("", "localhost", "127.0.0.1", "::1") or host.startswith("/")
+
+
+def flush_after_fsync_off(conn: dict[str, str]) -> None:
+    """Force data written while fsync was off to durable storage.
+
+    PostgreSQL requires this when fsync is switched back on: without it, a
+    crash can corrupt the cluster even though the setting is restored.
+    CHECKPOINT writes the shared buffers out and os.sync() flushes the kernel
+    buffers, which only reaches the server's disk because fsync is only ever
+    turned off for a server on this machine (see is_local_host()).
+    """
+    psql(conn, "postgres", "CHECKPOINT")
+    os.sync()
 
 
 def env_conn() -> dict[str, str]:
@@ -302,7 +320,11 @@ def pgdump_cmds(conn: dict[str, str], jobs: int, out: Path):
 def parse_variant(spec: str) -> tuple[str, str, str]:
     name, _, rest = spec.partition("=")
     kind, _, arg = rest.partition(":")
-    if not name or kind not in ("pgfanout", "pgdump") or (kind == "pgfanout" and not arg):
+    # The name becomes a directory under the work dir that is deleted
+    # recursively, so it must not be able to point anywhere else.
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+        sys.exit(f"bad variant name {name!r}: use letters, digits, '_', '-' and '.' only")
+    if kind not in ("pgfanout", "pgdump") or (kind == "pgfanout" and not arg):
         sys.exit(f"bad --variant {spec!r}; use NAME=pgfanout:BINDIR or NAME=pgdump")
     return name, kind, arg
 
@@ -327,7 +349,8 @@ def main() -> None:
     ap.add_argument(
         "--keep-fsync",
         action="store_true",
-        help="leave fsync on (realistic disk behaviour, noisier); default turns it off",
+        help="leave fsync on (realistic disk behaviour, noisier). By default fsync is "
+        "turned off, for a server on this machine only",
     )
     ap.add_argument("--workdir", default=None, help="where dumps are written (default: temp dir)")
     ap.add_argument("--out", default="bench-results.json")
@@ -352,19 +375,30 @@ def main() -> None:
     empty_config = workroot / "empty.toml"
     empty_config.write_text("")
 
+    # fsync is only turned off for a server on this machine: switching it back
+    # on safely needs the server's kernel buffers flushed (flush_after_fsync_off),
+    # which os.sync() can only do locally.
+    fsync_off = not args.no_stabilize and not args.keep_fsync and is_local_host(conn["host"])
+    if not args.no_stabilize and not args.keep_fsync and not fsync_off:
+        print(f"note: leaving fsync on, {conn['host']!r} is not a local server", file=sys.stderr)
     originals = read_overrides(conn) if not args.no_stabilize else {}
     touched: list[str] = []
     try:
         if not args.no_stabilize:
-            stabilize_server(conn, args.size_mb, not args.keep_fsync, touched)
+            stabilize_server(conn, args.size_mb, fsync_off, touched)
         data, results = run_benchmark(args, variants, conn, env, workroot, empty_config)
     finally:
         # Runs on success, failure and Ctrl-C alike, and must not hide the
         # original error if cleanup itself fails.
-        for label, step in (
+        cleanup = [
             ("drop databases", lambda: drop_databases(conn)),
             ("restore server settings", lambda: restore_server(conn, originals, touched)),
-        ):
+        ]
+        if "fsync" in touched:
+            cleanup.append(
+                ("flush data written with fsync off", lambda: flush_after_fsync_off(conn))
+            )
+        for label, step in cleanup:
             try:
                 step()
             except BaseException as exc:  # noqa: BLE001
@@ -377,7 +411,7 @@ def main() -> None:
         "repeats": args.repeats,
         "warmup": args.warmup,
         "stabilized": not args.no_stabilize,
-        "fsync_off": not args.no_stabilize and not args.keep_fsync,
+        "fsync_off": fsync_off,
         "jobs": args.jobs,
         "cpus": os.cpu_count(),
         "cpu_info": cpu_info(),

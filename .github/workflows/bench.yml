@@ -17,8 +17,9 @@ name: Benchmark
 #     checkpoint_timeout (a restore writes about as much WAL as it loads, and
 #     a checkpoint part-way through was the main source of restore noise),
 #     runs CHECKPOINT + sync before every timed command, and turns fsync off
-#     so the result does not depend on the runner's disk. All of it is reset
-#     afterwards. Do not publish numbers from this job; use bench.py with
+#     (local servers only) so the result does not depend on the runner's disk.
+#     All of it is reset afterwards, with a flush of what was written while
+#     fsync was off. Do not publish numbers from this job; use bench.py with
 #     --keep-fsync on a dedicated machine for those.
 #   * Measured on identical code (this workflow compares identical builds
 #     whenever a PR does not touch src/), base and PR differed by at most
