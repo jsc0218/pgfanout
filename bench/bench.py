@@ -153,15 +153,25 @@ def settle(conn: dict[str, str]) -> None:
     time.sleep(0.5)
 
 
-def stabilize_server(conn: dict[str, str], size_mb: int) -> None:
-    """Stop WAL-triggered checkpoints from landing inside a timed restore.
+def stabilize_server(conn: dict[str, str], size_mb: int, fsync_off: bool) -> None:
+    """Take disk-sync and checkpoint noise out of the timed commands.
 
-    Only touches settings that take effect on reload, and is undone by
-    restore_server() at the end of the run.
+    The aim is to catch code regressions, not to produce absolute numbers, so
+    the server is tuned for repeatability:
+      * max_wal_size / checkpoint_timeout are raised so no checkpoint starts
+        part-way through a restore;
+      * fsync is turned off (unless fsync_off is False) so the result does not
+        depend on how fast the runner's disk can sync, which is both noisy and
+        outside the code under test.
+    Only settings that take effect on reload are touched, and
+    restore_server() undoes them at the end of the run. Do not publish
+    numbers taken this way; use --keep-fsync for those.
     """
     wal_mb = max(4096, 4 * size_mb)
     psql(conn, "postgres", f"ALTER SYSTEM SET max_wal_size = '{wal_mb}MB'")
     psql(conn, "postgres", "ALTER SYSTEM SET checkpoint_timeout = '1h'")
+    if fsync_off:
+        psql(conn, "postgres", "ALTER SYSTEM SET fsync = off")
     psql(conn, "postgres", "SELECT pg_reload_conf()")
     time.sleep(1)
 
@@ -169,6 +179,7 @@ def stabilize_server(conn: dict[str, str], size_mb: int) -> None:
 def restore_server(conn: dict[str, str]) -> None:
     psql(conn, "postgres", "ALTER SYSTEM RESET max_wal_size")
     psql(conn, "postgres", "ALTER SYSTEM RESET checkpoint_timeout")
+    psql(conn, "postgres", "ALTER SYSTEM RESET fsync")
     psql(conn, "postgres", "SELECT pg_reload_conf()")
 
 
@@ -245,6 +256,11 @@ def main() -> None:
         action="store_true",
         help="leave server checkpoint settings alone and skip the pre-run checkpoint",
     )
+    ap.add_argument(
+        "--keep-fsync",
+        action="store_true",
+        help="leave fsync on (realistic disk behaviour, noisier); default turns it off",
+    )
     ap.add_argument("--workdir", default=None, help="where dumps are written (default: temp dir)")
     ap.add_argument("--out", default="bench-results.json")
     args = ap.parse_args()
@@ -256,7 +272,7 @@ def main() -> None:
     env = {**os.environ, "PGPASSWORD": conn["password"]}
 
     if not args.no_stabilize:
-        stabilize_server(conn, args.size_mb)
+        stabilize_server(conn, args.size_mb, fsync_off=not args.keep_fsync)
     print(f"Generating ~{args.size_mb} MB dataset ...", flush=True)
     gen_start = time.perf_counter()
     data = generate_dataset(conn, args.size_mb)
@@ -319,6 +335,7 @@ def main() -> None:
         "repeats": args.repeats,
         "warmup": args.warmup,
         "stabilized": not args.no_stabilize,
+        "fsync_off": not args.no_stabilize and not args.keep_fsync,
         "jobs": args.jobs,
         "cpus": os.cpu_count(),
         "platform": platform.platform(),

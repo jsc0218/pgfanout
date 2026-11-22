@@ -67,7 +67,8 @@ def main() -> None:
     print("### pgfanout benchmark\n")
     print(
         f"{size_mb:.0f} MB database, {meta['jobs']} jobs, median of {meta['repeats']} "
-        f"interleaved runs, {meta['cpus']} CPUs, PostgreSQL {meta['server_version']}. "
+        f"interleaved runs, {meta['cpus']} CPUs, PostgreSQL {meta['server_version']}"
+        f"{', fsync off' if meta.get('fsync_off') else ''}. "
         f"Threshold: {args.threshold:.0%} (and over {args.min_abs:g}s).\n"
     )
     print(f"| phase | {args.base} | {args.pr} | change | pr throughput | {ref_hdr} | verdict |")
