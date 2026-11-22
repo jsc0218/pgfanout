@@ -1,4 +1,4 @@
-"""Unit tests for src/storage.py.
+"""Unit tests for src/pgfanout/storage.py.
 
 No live Postgres or S3 needed — the local backend is exercised end-to-end
 against a tmp_path fixture, and the S3 backend is driven by a botocore
@@ -14,7 +14,7 @@ import pytest
 from botocore.exceptions import ClientError
 from botocore.stub import Stubber
 
-from storage import (
+from pgfanout.storage import (
     Blob,
     LocalBlob,
     S3Blob,
@@ -29,7 +29,7 @@ from storage import (
     makedirs,
     parse_s3_uri,
 )
-from storage import (
+from pgfanout.storage import (
     join as storage_join,
 )
 
@@ -332,7 +332,7 @@ def tiny_part_size(monkeypatch):
     :func:`test_s3_blob_rejects_too_small_part_size`, which doesn't use
     this fixture.
     """
-    import storage
+    from pgfanout import storage
 
     monkeypatch.setattr(storage, "S3_MIN_PART_SIZE", 1)
     yield 16
@@ -420,7 +420,7 @@ def test_s3_blob_rejects_too_small_part_size():
     with pytest.raises(ValueError, match=">="):
         # Construct a writer directly to bypass the _part_size override
         # trick our other tests use.
-        from storage import _S3MultipartWriter
+        from pgfanout.storage import _S3MultipartWriter
 
         _S3MultipartWriter(client=None, bucket="b", key="k", part_size=1024)
 

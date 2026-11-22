@@ -104,7 +104,7 @@ the captured stderr attached.
 ### Storage abstraction
 
 Storage is abstracted behind a single `Blob` interface
-(`src/storage.py`) with two backends:
+(`src/pgfanout/storage.py`) with two backends:
 
 | Backend     | URI form                   | Notes                                    |
 |-------------|----------------------------|------------------------------------------|
@@ -116,20 +116,30 @@ real on-disk path (`psql -f`, `pg_restore`): local blobs are zero-copy,
 S3 blobs are streamed to a `tempfile.NamedTemporaryFile` that is
 cleaned up even on exceptions.
 
+## Install
+
+```bash
+pip install pgfanout
+```
+
+This installs two commands, `pgfanout-dump` and `pgfanout-restore`. You
+also need the PostgreSQL client tools (`psql`, `pg_dump`, `pg_restore`) on
+your `PATH`, with the same major version as the server.
+
 ## Quick start
 
 ### Local disk
 
 ```bash
 # Dump a whole database in 8 parallel parts
-python3 src/parallel_dump.py \
+pgfanout-dump \
     --host db.example.com --port 5432 \
     --user backup_user --password "$PGPASSWORD" \
     --database mydb --num-parts 8 \
     --output-dir /data/dumps/mydb
 
 # Restore it into a fresh database with 4 index-build jobs
-python3 src/parallel_restore.py \
+pgfanout-restore \
     --host db.example.com --port 5432 \
     --user restore_user --password "$PGPASSWORD" \
     --database mydb_restored --index-jobs 4 \
@@ -147,13 +157,13 @@ export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_S3_VERIFY_SSL=false      # only if the endpoint has a self-signed cert
 
-python3 src/parallel_dump.py \
+pgfanout-dump \
     --host db.example.com \
     --user backup_user --password "$PGPASSWORD" \
     --database mydb --num-parts 8 \
     --output-dir s3://my-bucket/dumps/mydb
 
-python3 src/parallel_restore.py \
+pgfanout-restore \
     --host db.example.com \
     --user restore_user --password "$PGPASSWORD" \
     --database mydb_restored --index-jobs 4 \
@@ -207,7 +217,7 @@ recreates its tables before loading.
 ## S3 configuration
 
 All S3 configuration flows through standard AWS environment variables,
-resolved inside `src/storage.py::make_s3_client`.  No flags or
+resolved inside `src/pgfanout/storage.py::make_s3_client`.  No flags or
 config keys are involved — this keeps credentials out of TOML files
 and out of `ps` output.
 
@@ -233,7 +243,7 @@ export AWS_SECRET_ACCESS_KEY=...
 export AWS_S3_VERIFY_SSL=false       # self-signed certificate
 export AWS_REGION=us-east-1          # Ceph is region-agnostic, but boto3 wants a value
 
-python3 src/parallel_dump.py ... --output-dir s3://rdb-poc/backups/mydb
+pgfanout-dump ... --output-dir s3://rdb-poc/backups/mydb
 ```
 
 ### Multipart semantics
@@ -330,4 +340,4 @@ real credentials and a real S3 endpoint:
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](https://github.com/jsc0218/pgfanout/blob/main/LICENSE).

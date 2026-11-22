@@ -51,10 +51,6 @@ from moto.server import ThreadedMotoServer  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-def _script(name: str) -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "src", name)
-
-
 @pytest.fixture(scope="session")
 def moto_server():
     """Start moto's S3 server once per session and point env vars at it.
@@ -187,7 +183,7 @@ def run_s3_dump(
 
     *table=None* triggers database-level mode (multi-schema discovery).
     """
-    cmd = [sys.executable, _script("parallel_dump.py"), *_base_args()]
+    cmd = [sys.executable, "-m", "pgfanout.parallel_dump", *_base_args()]
     if table is not None:
         cmd += ["--schema", schema, "--table", table]
     cmd += ["--num-parts", str(num_parts), "--output-dir", output_uri]
@@ -201,7 +197,7 @@ def run_s3_restore(
     table: str | None = TABLE,
     index_jobs: int = 1,
 ) -> None:
-    cmd = [sys.executable, _script("parallel_restore.py"), *_base_args()]
+    cmd = [sys.executable, "-m", "pgfanout.parallel_restore", *_base_args()]
     if table is not None:
         cmd += ["--schema", schema, "--table", table]
     cmd += ["--input-dir", input_uri]

@@ -17,7 +17,7 @@ from unittest import mock
 
 import pytest
 
-import common
+from pgfanout import common
 
 
 class _FakeConn:

@@ -60,7 +60,7 @@ Parameters:
                --retries       (max retries for failed parts; default: 0)
 
 Single-table mode (explicit --table):
-    python3 src/parallel_restore.py \\
+    pgfanout-restore \\
         --host HOST --user USER --password PASS \\
         --database mydb --table mytable \\
         --input-dir s3://my-bucket/dumps/mydb/mytable
@@ -68,7 +68,7 @@ Single-table mode (explicit --table):
     Files are read directly from --input-dir.
 
 Database-level mode (omit --table):
-    python3 src/parallel_restore.py \\
+    pgfanout-restore \\
         --host HOST --user USER --password PASS \\
         --database mydb --input-dir s3://my-bucket/dumps/mydb
 
@@ -96,7 +96,7 @@ import time
 
 import psycopg
 
-from common import (
+from .common import (
     GLOBAL_POST_DATA_FILENAME,
     GLOBAL_PRE_DATA_FILENAME,
     LOG,
@@ -123,8 +123,8 @@ from common import (
     tracked_connection,
     validate_connection_args,
 )
-from storage import Blob, is_dir, is_file, list_dir, localize, make_blob
-from storage import join as storage_join
+from .storage import Blob, is_dir, is_file, list_dir, localize, make_blob
+from .storage import join as storage_join
 
 # Chunk size used when streaming a part blob into psql's stdin for
 # COPY FROM STDIN.  Large enough to amortise per-write pipe-syscall
