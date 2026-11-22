@@ -144,12 +144,19 @@ jobs:
         id: base
         run: |
           base="$BASE"
-          # A push that creates a branch has an all-zero "before", and a force
-          # push can leave "before" unreachable. Compare with the parent then.
-          if [ -z "$base" ] \
-             || [ "$base" = "0000000000000000000000000000000000000000" ] \
-             || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+          # Only a push can legitimately lack a usable base: a push that creates
+          # a branch has an all-zero "before", and a force push can leave
+          # "before" unreachable. Compare with the parent in that case. For a
+          # pull request or a manual run a missing base is a mistake, so fail
+          # instead of quietly comparing against something else.
+          if [ "$GITHUB_EVENT_NAME" = "push" ] \
+             && { [ "$base" = "0000000000000000000000000000000000000000" ] \
+                  || ! git cat-file -e "${base}^{commit}" 2>/dev/null; }; then
             base=HEAD^
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "::error::Cannot resolve the base commit '${BASE}' (event: ${GITHUB_EVENT_NAME})."
+            exit 1
           fi
           echo "sha=$(git rev-parse "$base")" >> "$GITHUB_OUTPUT"
 
