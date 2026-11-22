@@ -243,9 +243,11 @@ and out of `ps` output.
 Credentials are also read from `~/.aws/credentials` if not set
 explicitly — boto3's default chain applies.
 
-The multipart upload parts are 16 MiB (5 MiB is the S3 minimum) and a failed
-upload is aborted so no orphaned parts are billed; see
-`src/pgfanout/storage.py`.
+The multipart upload parts are 16 MiB (5 MiB is the S3 minimum). A failed
+upload is aborted on a best-effort basis: if the abort call itself fails (the
+endpoint is down, or `s3:AbortMultipartUpload` is not allowed), the uploaded
+parts stay and keep accruing storage charges, so add a bucket lifecycle rule
+that aborts incomplete multipart uploads. See `src/pgfanout/storage.py`.
 
 ## 📝 Config file
 

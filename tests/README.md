@@ -10,10 +10,19 @@ repository root:
 python3 tests/run_local.py
 ```
 
+> **Warning:** the runner force-removes any existing container named
+> `backup-test-pg17` before starting its own, and publishes the server on host
+> port 5434. If you have a container with that name, rename it first.
+
 Against a Postgres you already have running, install the test
 dependencies and point the standard libpq environment variables at it.
 The client tools on your `PATH` must be the same major version as the
-server, since `pg_dump` refuses to talk to a newer one:
+server, since `pg_dump` refuses to talk to a newer one.
+
+> **Warning:** the suite drops and recreates the databases
+> `parallel_backup_test` and `special_chars_test` on that server, and drops
+> them again when it finishes. Any data in databases with those names is
+> lost, so use a disposable server.
 
 ```bash
 pip install -r requirements-dev.txt

@@ -245,8 +245,9 @@ class _S3MultipartWriter:
     * Zero-byte "close with no write" produces an empty object, written
       with a plain ``PutObject`` because S3 rejects a multipart upload
       with zero parts.
-    * Exception inside the ``with`` block aborts the multipart upload
-      so the user isn't billed for dangling parts.
+    * Exception inside the ``with`` block aborts the multipart upload,
+      best effort: if the abort call itself fails the parts stay on the
+      server (and accrue charges) until a bucket lifecycle rule removes them.
     * Chunks smaller than the part size accumulate; the part is flushed
       only once the buffer has enough data.  The final buffer (whatever
       remains at close) is uploaded as the last part regardless of size.
@@ -298,6 +299,10 @@ class _S3MultipartWriter:
 
     def _best_effort_abort(self) -> None:
         """Tear down the multipart upload so dangling parts don't accrue charges.
+
+        Best effort: a failure of the abort call is swallowed, so the original
+        error is not masked, and the parts then remain until a bucket
+        lifecycle rule removes them.
 
         Idempotent: clears ``_upload_id`` so repeat calls from overlapping
         error paths (e.g. an ``UploadPartCopy`` failure followed by an
