@@ -44,6 +44,30 @@ DST_DB = "pgfanout_bench_dst"
 BIG_ROW_BYTES = 172
 
 
+def cpu_info() -> dict[str, object]:
+    """CPU model and core/thread layout (Linux only; empty elsewhere).
+
+    os.cpu_count() reports logical CPUs, which on a cloud VM are usually
+    hyper-threads, so it overstates how many real cores a parallel job has.
+    """
+    info: dict[str, object] = {"logical_cpus": os.cpu_count()}
+    try:
+        text = subprocess.run(["lscpu"], capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return info
+    fields = {k.strip(): v.strip() for k, _, v in (ln.partition(":") for ln in text.splitlines())}
+    info["model"] = fields.get("Model name")
+    info["hypervisor"] = fields.get("Hypervisor vendor")
+    try:
+        threads = int(fields["Thread(s) per core"])
+        cores = int(fields["Core(s) per socket"]) * int(fields["Socket(s)"])
+        info["threads_per_core"] = threads
+        info["physical_cores"] = cores
+    except (KeyError, ValueError):
+        pass
+    return info
+
+
 def env_conn() -> dict[str, str]:
     conn = {
         "host": os.environ.get("PGHOST", "localhost"),
@@ -338,6 +362,7 @@ def main() -> None:
         "fsync_off": not args.no_stabilize and not args.keep_fsync,
         "jobs": args.jobs,
         "cpus": os.cpu_count(),
+        "cpu_info": cpu_info(),
         "platform": platform.platform(),
         "python": platform.python_version(),
         "server_version": psql(conn, "postgres", "SHOW server_version"),

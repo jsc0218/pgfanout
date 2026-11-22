@@ -20,6 +20,15 @@ import statistics
 import sys
 
 
+def cpu_text(meta: dict) -> str:
+    info = meta.get("cpu_info") or {}
+    text = f"{meta['cpus']} logical CPUs"
+    if info.get("physical_cores") and info.get("threads_per_core"):
+        text += f" ({info['physical_cores']} cores x {info['threads_per_core']} threads"
+        text += f", {info['model']})" if info.get("model") else ")"
+    return text
+
+
 def spread(values: list[float]) -> str:
     if len(values) < 2:
         return "n/a"
@@ -67,7 +76,7 @@ def main() -> None:
     print("### pgfanout benchmark\n")
     print(
         f"{size_mb:.0f} MB database, {meta['jobs']} jobs, median of {meta['repeats']} "
-        f"interleaved runs, {meta['cpus']} CPUs, PostgreSQL {meta['server_version']}"
+        f"interleaved runs, {cpu_text(meta)}, PostgreSQL {meta['server_version']}"
         f"{', fsync off' if meta.get('fsync_off') else ''}. "
         f"Threshold: {args.threshold:.0%} (and over {args.min_abs:g}s).\n"
     )
