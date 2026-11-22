@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Benchmark pgfanout against itself (two builds) and against pg_dump/pg_restore.
 
-Generates a deterministic dataset once, then for each repeat runs every
+Generates a deterministic dataset once (a single large table with a primary
+key and a secondary index, which is the case pgfanout targets and where
+pg_dump -j cannot split the work), then for each repeat runs every
 variant through dump -> restore -> row-count verification. Variants are
 interleaved (and their order rotated each round) so that machine noise
 affects all of them equally. Results go to a JSON file; use compare.py to
@@ -40,8 +42,6 @@ DST_DB = "pgfanout_bench_dst"
 # Rough heap bytes per generated "big" row, used only to turn --size-mb into a
 # row count. The real size is measured and recorded in the results.
 BIG_ROW_BYTES = 172
-BIG_SHARE = 0.7  # fraction of --size-mb in the single big table
-MEDIUM_TABLES = 3
 
 
 def env_conn() -> dict[str, str]:
@@ -105,30 +105,27 @@ def generate_dataset(conn: dict[str, str], size_mb: int) -> dict:
     psql(conn, "postgres", f"DROP DATABASE IF EXISTS {SRC_DB}")
     psql(conn, "postgres", f"CREATE DATABASE {SRC_DB}")
 
-    big_rows = int(size_mb * BIG_SHARE * 1024 * 1024 / BIG_ROW_BYTES)
-    medium_rows = int(size_mb * (1 - BIG_SHARE) / MEDIUM_TABLES * 1024 * 1024 / BIG_ROW_BYTES)
-
-    def table(name: str, rows: int) -> str:
-        return f"""
-            CREATE TABLE {name} (
-                id bigint PRIMARY KEY,
-                a  int NOT NULL,
-                b  text NOT NULL,
-                c  timestamptz NOT NULL,
-                d  numeric(12,2) NOT NULL
-            );
-            INSERT INTO {name}
-            SELECT i, (i * 7919) % 100000,
-                   md5(i::text) || md5((i * 3)::text),
-                   timestamptz '2020-01-01' + (i % 1000000) * interval '1 second',
-                   ((i * 31) % 1000000) / 100.0
-            FROM generate_series(1::bigint, {rows}::bigint) AS s(i);
-        """
-
-    sql = table("big", big_rows) + "CREATE INDEX big_a_idx ON big (a);"
-    for n in range(MEDIUM_TABLES):
-        sql += table(f"medium_{n}", medium_rows)
-    psql(conn, SRC_DB, sql)
+    rows = int(size_mb * 1024 * 1024 / BIG_ROW_BYTES)
+    psql(
+        conn,
+        SRC_DB,
+        f"""
+        CREATE TABLE big (
+            id bigint PRIMARY KEY,
+            a  int NOT NULL,
+            b  text NOT NULL,
+            c  timestamptz NOT NULL,
+            d  numeric(12,2) NOT NULL
+        );
+        INSERT INTO big
+        SELECT i, (i * 7919) % 100000,
+               md5(i::text) || md5((i * 3)::text),
+               timestamptz '2020-01-01' + (i % 1000000) * interval '1 second',
+               ((i * 31) % 1000000) / 100.0
+        FROM generate_series(1::bigint, {rows}::bigint) AS s(i);
+        CREATE INDEX big_a_idx ON big (a);
+        """,
+    )
     psql(conn, SRC_DB, "VACUUM ANALYZE")
     psql(conn, SRC_DB, "CHECKPOINT")
 

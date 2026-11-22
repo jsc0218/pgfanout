@@ -311,8 +311,9 @@ retries = 1
 
 ## Benchmarks
 
-`bench/bench.py` generates a deterministic dataset, then runs dump, restore
-and a row-count check for each variant you give it, interleaving the
+`bench/bench.py` generates a deterministic dataset, a single large table
+with a primary key and one secondary index, then runs dump, restore and a
+row-count check for each variant you give it, interleaving the
 variants and discarding a warm-up round so machine noise hits all of them
 equally. `bench/compare.py` turns the JSON into a table and a verdict.
 
