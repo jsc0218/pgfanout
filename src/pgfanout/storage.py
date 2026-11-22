@@ -242,9 +242,12 @@ class _S3MultipartWriter:
 
     Behaviour matches the local file handle returned by :meth:`LocalBlob.open_write`:
 
-    * Zero-byte "close with no write" produces an empty object.
-    * Exception inside the ``with`` block aborts the multipart upload
-      so the user isn't billed for dangling parts.
+    * Zero-byte "close with no write" produces an empty object, written
+      with a plain ``PutObject`` because S3 rejects a multipart upload
+      with zero parts.
+    * Exception inside the ``with`` block aborts the multipart upload,
+      best effort: if the abort call itself fails the parts stay on the
+      server (and accrue charges) until a bucket lifecycle rule removes them.
     * Chunks smaller than the part size accumulate; the part is flushed
       only once the buffer has enough data.  The final buffer (whatever
       remains at close) is uploaded as the last part regardless of size.
@@ -296,6 +299,10 @@ class _S3MultipartWriter:
 
     def _best_effort_abort(self) -> None:
         """Tear down the multipart upload so dangling parts don't accrue charges.
+
+        Best effort: a failure of the abort call is swallowed, so the original
+        error is not masked, and the parts then remain until a bucket
+        lifecycle rule removes them.
 
         Idempotent: clears ``_upload_id`` so repeat calls from overlapping
         error paths (e.g. an ``UploadPartCopy`` failure followed by an
@@ -435,6 +442,11 @@ class S3Blob(Blob):
         return _S3MultipartWriter(self._get_client(), self._bucket, self._key, self._part_size)  # type: ignore[return-value]
 
     def open_read(self) -> BinaryIO:
+        """Return a chunked streaming reader (a boto3 ``StreamingBody``).
+
+        ``read(n)`` pulls only *n* bytes, so a restore never materialises
+        the whole object in memory.
+        """
         return _S3StreamReader(self._get_client(), self._bucket, self._key)  # type: ignore[return-value]
 
     def size(self) -> int:
