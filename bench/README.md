@@ -62,8 +62,10 @@ the measured rounds.
 ## In CI
 
 The **Benchmark** workflow runs this on pull requests that touch `src/` or
-`bench/`, comparing the base branch with the PR on the same runner. It is
-advisory unless enforcement is turned on, and it never runs on a schedule.
+`bench/` (the base branch against the PR, on the same runner) and on every
+push to `main` that touches them (the new commit against the one before it).
+It can also be started by hand from the Actions tab. It is advisory unless
+enforcement is turned on, and it never runs on a schedule.
 How it works, how stable it has been, and what it cannot detect (the runner
 has 2 physical cores with hyper-threads, and the server shares them with the
 clients) is documented at the top of
