@@ -27,6 +27,8 @@ for logical backups of a PostgreSQL database.
 * 🐍 **Python on the control plane.** Snapshot export, catalog discovery,
   cancellation and retries are Python; the bytes flow through native tools.
 * 🔌 **Any PostgreSQL 14+ you can reach over libpq.** Nothing vendor-specific.
+* 📊 **Benchmarked in CI.** Every PR is compared against `main` on the same
+  runner (see [`bench/`](bench/README.md)).
 
 Data bytes flow from Postgres through a `psql` subprocess and a pipe
 into the storage sink (local file or S3 multipart upload), chunk by
