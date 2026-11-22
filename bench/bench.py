@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Benchmark pgfanout against itself (two builds) and against pg_dump/pg_restore.
 
-Generates a deterministic dataset once (a single large table with a primary
-key and a secondary index, which is the case pgfanout targets and where
-pg_dump -j cannot split the work), then for each repeat runs every
-variant through dump -> restore -> row-count verification. Variants are
+Generates a deterministic dataset once (a single large plain table with no
+indexes, which is the case pgfanout targets and where pg_dump -j cannot
+split the work, and which isolates raw data dump and load speed), then for
+each repeat runs every variant through dump -> restore -> row-count verification. Variants are
 interleaved (and their order rotated each round) so that machine noise
 affects all of them equally. Results go to a JSON file; use compare.py to
 turn that into a report and a pass/fail verdict.
@@ -111,7 +111,7 @@ def generate_dataset(conn: dict[str, str], size_mb: int) -> dict:
         SRC_DB,
         f"""
         CREATE TABLE big (
-            id bigint PRIMARY KEY,
+            id bigint NOT NULL,
             a  int NOT NULL,
             b  text NOT NULL,
             c  timestamptz NOT NULL,
@@ -123,7 +123,6 @@ def generate_dataset(conn: dict[str, str], size_mb: int) -> dict:
                timestamptz '2020-01-01' + (i % 1000000) * interval '1 second',
                ((i * 31) % 1000000) / 100.0
         FROM generate_series(1::bigint, {rows}::bigint) AS s(i);
-        CREATE INDEX big_a_idx ON big (a);
         """,
     )
     psql(conn, SRC_DB, "VACUUM ANALYZE")
