@@ -216,7 +216,7 @@ Output layout:
 | `--table T`       |         | Omit for database-level restore (auto-detects `<schema>/<table>/` layout)    |
 | `--schema S`      | `public`| Only with `--table`                                                          |
 | `--index-jobs N`  | `1`     | Parallel `pg_restore -j N` for index / constraint build                      |
-| `--unlogged`      | off     | `ALTER TABLE … SET UNLOGGED` during load, `SET LOGGED` after; much faster, but a server crash mid-load truncates the table and the restore must start over |
+| `--unlogged`      | off     | `ALTER TABLE … SET UNLOGGED` during load, `SET LOGGED` after. The load itself skips WAL, but `SET LOGGED` rewrites the table and writes it to WAL, so total time can be longer. A server crash mid-load truncates the table and the restore must start over |
 | `--input-dir D`   |         | **Required.** Local path **or** `s3://bucket/prefix`                         |
 
 The restore is idempotent within a database: each invocation drops and

@@ -1242,9 +1242,10 @@ def main() -> None:
         const=True,
         default=None,
         help="Optional. Set tables to UNLOGGED during bulk load to skip WAL writes, "
-        "then SET LOGGED after.  Substantially faster, but the table is "
-        "truncated if the server crashes mid-load, so the restore must be "
-        "restarted from the beginning.",
+        "then SET LOGGED after.  The load itself skips WAL, but SET LOGGED "
+        "rewrites the table and writes it to WAL, so total time can be "
+        "longer.  The table is truncated if the server crashes mid-load, "
+        "so the restore must be restarted from the beginning.",
     )
     parser.add_argument(
         "--retries",
