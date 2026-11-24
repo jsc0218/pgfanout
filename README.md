@@ -5,7 +5,7 @@
 [![CI](https://github.com/jsc0218/pgfanout/actions/workflows/ci.yml/badge.svg)](https://github.com/jsc0218/pgfanout/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/pgfanout.svg?logo=pypi&logoColor=white)](https://pypi.org/project/pgfanout/)
 [![Python](https://img.shields.io/pypi/pyversions/pgfanout.svg?logo=python&logoColor=white)](https://pypi.org/project/pgfanout/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14%20%7C%2015%20%7C%2016%20%7C%2017%20%7C%2018-336791.svg?logo=postgresql&logoColor=white)](#-install)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14%20%7C%2015%20%7C%2016%20%7C%2017%20%7C%2018%20%7C%2019-336791.svg?logo=postgresql&logoColor=white)](#-install)
 [![S3](https://img.shields.io/badge/S3-compatible-569A31.svg?logo=amazons3&logoColor=white)](#-s3-configuration)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/jsc0218/pgfanout/blob/main/LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
