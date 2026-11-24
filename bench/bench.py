@@ -368,7 +368,7 @@ def main() -> None:
         ap.error("--repeats must be at least 1")
     if args.warmup < 0:
         ap.error("--warmup must not be negative")
-    if args.jobs < 1:
+    if args.jobs_sweep is None and args.jobs < 1:
         ap.error("--jobs must be at least 1")
     if args.jobs_sweep is not None:
         try:
