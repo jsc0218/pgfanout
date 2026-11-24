@@ -317,8 +317,16 @@ def pgdump_cmds(conn: dict[str, str], jobs: int, out: Path):
     return dump, restore
 
 
-def parse_variant(spec: str) -> tuple[str, str, str]:
+def parse_variant(spec: str) -> tuple[str, str, str, int | None]:
     name, _, rest = spec.partition("=")
+    # An optional trailing @N pins the variant to N jobs in a --jobs-sweep run.
+    pinned = None
+    m = re.search(r"@(\d+)$", rest)
+    if m:
+        pinned = int(m.group(1))
+        rest = rest[: m.start()]
+        if pinned < 1:
+            sys.exit(f"bad --variant {spec!r}: @JOBS must be at least 1")
     kind, _, arg = rest.partition(":")
     # The name becomes a directory under the work dir that is deleted
     # recursively, so it must not be able to point anywhere else.
@@ -326,7 +334,7 @@ def parse_variant(spec: str) -> tuple[str, str, str]:
         sys.exit(f"bad variant name {name!r}: use letters, digits, '_', '-' and '.' only")
     if kind not in ("pgfanout", "pgdump") or (kind == "pgfanout" and not arg):
         sys.exit(f"bad --variant {spec!r}; use NAME=pgfanout:BINDIR or NAME=pgdump")
-    return name, kind, arg
+    return name, kind, arg, pinned
 
 
 def main() -> None:
@@ -382,8 +390,10 @@ def main() -> None:
     if args.size_mb < 1:
         ap.error("--size-mb must be at least 1")
     variants = [parse_variant(v) for v in args.variant]
-    if len({n for n, _, _ in variants}) != len(variants):
+    if len({v[0] for v in variants}) != len(variants):
         ap.error("variant names must be unique")
+    if args.sweep is None and any(v[3] for v in variants):
+        ap.error("NAME=...@JOBS pins a variant's job count and needs --jobs-sweep")
     conn = env_conn()
     env = {**os.environ, "PGPASSWORD": conn["password"]}
 
@@ -460,14 +470,18 @@ def run_benchmark(args, variants, conn, env, workroot: Path, empty_config: Path)
         flush=True,
     )
 
-    # One entry per (variant, job count); without a sweep that is just the variants.
-    combos = [
-        (f"{n}@{j}" if args.sweep else n, k, a, j)
-        for j in (args.sweep or [args.jobs])
-        for n, k, a in variants
-    ]
+    # One entry per (variant, job count); without a sweep that is just the
+    # variants. A variant pinned with @JOBS runs once, at that job count, and
+    # keeps its plain name (a reference point beside the sweep).
+    combos = []
+    for j in args.sweep or [args.jobs]:
+        for n, k, a, pinned in variants:
+            if pinned is None:
+                combos.append((f"{n}@{j}" if args.sweep else n, k, a, j))
+    combos += [(n, k, a, pinned) for n, k, a, pinned in variants if pinned]
     results: dict[str, dict] = {
-        key: {"dump_s": [], "restore_s": [], "dump_bytes": None} for key, _, _, _ in combos
+        key: {"dump_s": [], "restore_s": [], "dump_bytes": None, "jobs": jobs}
+        for key, _, _, jobs in combos
     }
     for rnd in range(-args.warmup, args.repeats):
         # Rotate the order each round so no variant always runs first (warm cache).

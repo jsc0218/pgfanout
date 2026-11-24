@@ -50,12 +50,15 @@ job counts in one interleaved run and summarize it:
 
 ```bash
 python3 bench/bench.py \
-    --variant pgfanout=pgfanout:.venv/bin --variant pg_dump=pgdump \
+    --variant pgfanout=pgfanout:.venv/bin --variant pg_dump=pgdump@1 \
     --size-mb 20000 --repeats 3 --jobs-sweep 1,2,4,8,16 --out sweep.json
 python3 bench/sweep_report.py sweep.json
 ```
 
-Results are keyed `NAME@JOBS`, and `--jobs` is ignored. Efficiency is the
+Results are keyed `NAME@JOBS`, and `--jobs` is ignored. A trailing `@N` on a
+variant pins it to `N` jobs, so it runs once as a reference row instead of at
+every count: `--variant pg_dump=pgdump@1` times `pg_dump` once with one job,
+which is the useful baseline because `pg_dump -j` cannot split a single table. Efficiency is the
 speedup divided by the growth in job count, so about 100% means it still
 scales and a fall-off shows where the CPU, the server or the disk becomes the
 limit. Use a dataset large enough that the fixed startup cost (about 0.1-0.7s)
