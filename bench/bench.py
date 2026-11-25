@@ -563,13 +563,17 @@ def main() -> None:
             ("drop databases", lambda: drop_databases(conn)),
             ("restore server settings", lambda: restore_server(conn, originals, touched)),
         ]
-        s3_label = "delete the S3 test objects"
-        if args.storage_run:
-            cleanup.append((s3_label, lambda: s3_clear(args.storage_run)))
         if "fsync" in touched:
+            # Straight after fsync is back on, and before anything that talks to
+            # the network: until this runs, the data written with fsync off is not
+            # durable, and a crash in that window can corrupt the cluster. The S3
+            # cleanup below can be slow (many objects, retries, a hung connection).
             cleanup.append(
                 ("flush data written with fsync off", lambda: flush_after_fsync_off(conn))
             )
+        s3_label = "delete the S3 test objects"
+        if args.storage_run:
+            cleanup.append((s3_label, lambda: s3_clear(args.storage_run)))
         for label, step in cleanup:
             try:
                 step()
