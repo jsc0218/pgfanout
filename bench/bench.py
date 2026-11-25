@@ -163,13 +163,20 @@ def s3_client():
         or None,
         "region_name": os.environ.get("AWS_REGION") or "us-east-1",
     }
-    # AWS_S3_VERIFY_SSL, resolved the way pgfanout does: a boolean, or a CA bundle path.
-    raw = (os.environ.get("AWS_S3_VERIFY_SSL") or "").strip()
-    if raw:
-        if raw.lower() in ("0", "false", "no", "off"):
+    # AWS_S3_VERIFY_SSL, resolved exactly the way pgfanout does (make_s3_client): a
+    # boolean, or a CA bundle path. A true value is passed explicitly, so it means
+    # the default trust store here as in pgfanout, and not whatever AWS_CA_BUNDLE
+    # or a profile would pick; otherwise the preflight could pass on a bundle the
+    # dump does not use.
+    raw = os.environ.get("AWS_S3_VERIFY_SSL")
+    if raw is not None and raw != "":
+        flag = raw.strip().lower()
+        if flag in ("0", "false", "no", "off"):
             kwargs["verify"] = False
-        elif raw.lower() not in ("1", "true", "yes", "on"):
-            kwargs["verify"] = raw
+        elif flag in ("1", "true", "yes", "on"):
+            kwargs["verify"] = True
+        else:
+            kwargs["verify"] = raw  # anything else is a CA bundle path
     return boto3.client(**kwargs)
 
 
