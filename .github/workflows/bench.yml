@@ -197,7 +197,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           fail=""
           if [ "$ENFORCE" = "true" ]; then fail="--fail"; fi
-          echo "Fail on regression: ${ENFORCE}. Threshold: ${THRESHOLD}." >> "$GITHUB_STEP_SUMMARY"
+          echo "Fail on regression: ${ENFORCE}." >> "$GITHUB_STEP_SUMMARY"
           set +e
           python3 bench/compare.py bench-results.json \
             --base base --pr pr --reference pg_dump \
