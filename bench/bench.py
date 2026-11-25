@@ -215,22 +215,33 @@ def s3_clear(uri: str) -> None:
     from botocore.exceptions import ClientError
 
     bucket, prefix = s3_split(uri)
-    # A delete can succeed overall yet fail for single keys, so keep going and
-    # report everything that was left behind at the end.
+    # The two phases are independent: a failure in one (a denied or failed request,
+    # or a delete that succeeds overall yet fails for single keys) must not stop
+    # the other, and everything left behind is reported together at the end.
     errors: list[str] = []
-    pages = client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
-    for page in pages:
-        keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
-        if keys:
-            resp = client.delete_objects(Bucket=bucket, Delete={"Objects": keys, "Quiet": True})
-            errors += [f"{e.get('Key')}: {e.get('Code')}" for e in resp.get("Errors", [])]
-    pages = client.get_paginator("list_multipart_uploads").paginate(Bucket=bucket, Prefix=prefix)
-    for page in pages:
-        for up in page.get("Uploads", []):
-            try:
-                client.abort_multipart_upload(Bucket=bucket, Key=up["Key"], UploadId=up["UploadId"])
-            except ClientError as exc:
-                errors.append(f"{up['Key']}: abort failed ({exc.response['Error']['Code']})")
+    try:
+        pages = client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
+        for page in pages:
+            keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+            if keys:
+                resp = client.delete_objects(Bucket=bucket, Delete={"Objects": keys, "Quiet": True})
+                errors += [f"{e.get('Key')}: {e.get('Code')}" for e in resp.get("Errors", [])]
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"deleting objects failed: {exc}")
+    try:
+        pages = client.get_paginator("list_multipart_uploads").paginate(
+            Bucket=bucket, Prefix=prefix
+        )
+        for page in pages:
+            for up in page.get("Uploads", []):
+                try:
+                    client.abort_multipart_upload(
+                        Bucket=bucket, Key=up["Key"], UploadId=up["UploadId"]
+                    )
+                except ClientError as exc:
+                    errors.append(f"{up['Key']}: abort failed ({exc.response['Error']['Code']})")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"aborting multipart uploads failed: {exc}")
     if errors:
         raise RuntimeError(
             f"{len(errors)} S3 object(s) under {uri} could not be removed, e.g. {errors[0]}"
@@ -511,6 +522,8 @@ def main() -> None:
         # Random, so two runs on different hosts can never share a prefix.
         args.storage_run = f"{args.storage.rstrip('/')}/bench-{secrets.token_hex(8)}"
         s3_preflight(args.storage_run)
+        # Printed (and flushed) up front so a killed run can still be cleaned up by hand.
+        print(f"S3 run prefix: {args.storage_run}/", flush=True)
     else:
         args.storage_run = None
     conn = env_conn()
@@ -529,10 +542,13 @@ def main() -> None:
         print(f"note: leaving fsync on, {conn['host']!r} is not a local server", file=sys.stderr)
     originals = read_overrides(conn) if not args.no_stabilize else {}
     touched: list[str] = []
+    benchmark_ok = False
+    s3_cleanup_failure: BaseException | None = None
     try:
         if not args.no_stabilize:
             stabilize_server(conn, args.size_mb, fsync_off, touched)
         data, results = run_benchmark(args, variants, conn, env, workroot, empty_config)
+        benchmark_ok = True
     finally:
         # Runs on success, failure and Ctrl-C alike, and must not hide the
         # original error if cleanup itself fails.
@@ -540,8 +556,9 @@ def main() -> None:
             ("drop databases", lambda: drop_databases(conn)),
             ("restore server settings", lambda: restore_server(conn, originals, touched)),
         ]
+        s3_label = "delete the S3 test objects"
         if args.storage_run:
-            cleanup.append(("delete the S3 test objects", lambda: s3_clear(args.storage_run)))
+            cleanup.append((s3_label, lambda: s3_clear(args.storage_run)))
         if "fsync" in touched:
             cleanup.append(
                 ("flush data written with fsync off", lambda: flush_after_fsync_off(conn))
@@ -551,6 +568,8 @@ def main() -> None:
                 step()
             except BaseException as exc:  # noqa: BLE001
                 print(f"warning: could not {label}: {exc}", file=sys.stderr)
+                if label == s3_label:
+                    s3_cleanup_failure = exc
         if not args.workdir:
             shutil.rmtree(workroot, ignore_errors=True)
 
@@ -575,6 +594,14 @@ def main() -> None:
         r["restore_median_s"] = round(statistics.median(r["restore_s"]), 3)
     Path(args.out).write_text(json.dumps({"meta": meta, "results": results}, indent=2) + "\n")
     print(f"Wrote {args.out}")
+    # Objects left in S3 cost money, so a successful run must not hide that. The
+    # results are saved first (they can take hours to produce), then this fails.
+    # If the benchmark itself failed, that error is the one that propagates.
+    if benchmark_ok and s3_cleanup_failure is not None:
+        sys.exit(
+            f"error: the benchmark finished but the S3 cleanup failed: {s3_cleanup_failure}\n"
+            f"Delete {args.storage_run}/ by hand."
+        )
 
 
 def drop_databases(conn: dict[str, str]) -> None:

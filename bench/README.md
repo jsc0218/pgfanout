@@ -86,7 +86,9 @@ python3 bench/sweep_report.py s3-sweep.json
 - Only pgfanout variants work: `pg_dump` cannot write to S3.
 - Every run writes under its own random `PREFIX/bench-<id>/` and deletes it
   afterwards, including unfinished multipart uploads, so it never touches
-  other objects. If a run is killed, delete that prefix by hand. Use an
+  other objects. The prefix is printed when the run starts; if a run is killed,
+  delete it by hand. If the final cleanup fails the results are still saved, but
+  the run exits with an error naming the prefix. Use an
   **unversioned** bucket: in a versioned one a delete only adds a marker and
   keeps the data, so the harness refuses it. `PREFIX` must not contain `?`, `#`
   or a leading `//`.
