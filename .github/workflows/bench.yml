@@ -9,7 +9,7 @@ name: Benchmark
 #   interleaved with the order rotated, and a warm-up round is discarded, so
 #   noise on the shared runner hits every variant equally. bench/compare.py
 #   writes a table to the job summary and flags a PR that is slower than the
-#   base by more than 10% (and by more than 0.2s) on the median of 5 rounds.
+#   base by more than 5% (and by more than 0.2s) on the median of 5 rounds.
 #
 # Why it can be trusted, and where it cannot
 #   * It is built to catch regressions, not to produce absolute numbers. The
@@ -22,12 +22,16 @@ name: Benchmark
 #     fsync was off. Do not publish numbers from this job; use bench.py with
 #     --keep-fsync on a dedicated machine for those.
 #   * Measured on identical code (this workflow compares identical builds
-#     whenever a PR does not touch src/), base and PR differed by at most
-#     4.4% on dump and 1.0% on restore over six runs. Absolute times move
-#     by 15% or more between jobs because each job lands on a different VM,
-#     which is why only the in-job comparison means anything. The 10%
-#     threshold therefore leaves about a 2x margin on dump, so treat a single
-#     flagged dump result as "re-run" before treating it as a regression.
+#     whenever a PR does not touch src/): over the 18 such runs since the
+#     harness settled (22-25 Nov 2026), base and PR differed by 0.4% at the
+#     median on restore (at most 1.3%, 0.03s) and 2.0% on dump (at most 5.8%,
+#     0.18s). Absolute times move by 15% or more between jobs because each job
+#     lands on a different VM, which is why only the in-job comparison means
+#     anything. Restore therefore has a wide margin under a 5% threshold. Dump
+#     does not: two of those 18 runs were over 5% on identical code, and were
+#     kept from being flagged only by the 0.2s floor, which is 7-13% of a dump
+#     here. So the floor is what makes 5% usable, and a single flagged dump
+#     result should be re-run before it is treated as a regression.
 #   * Server and clients share the runner's 4 vCPUs, which are 2 physical
 #     cores with 2 hyper-threads each. A worker costs about 1.4 cores (server
 #     backend plus psql), so the speedup here is capped well below the number
@@ -43,8 +47,10 @@ name: Benchmark
 #   * on demand (workflow_dispatch).
 # There is deliberately no schedule trigger.
 #
-# It is advisory by default: it fails only when "enforce" is turned on
-# (workflow_dispatch).
+# It fails the job when a regression is found (the report is still written to
+# the job summary, and uploaded, first). A manual run can turn that off with
+# the "enforce" input. Whether a failed run also blocks merging is a branch
+# protection setting: it does only if this check is made a required one.
 on:
   pull_request:
     paths:
@@ -71,12 +77,12 @@ on:
         description: 'Measured rounds per variant'
         default: '5'
       threshold:
-        description: 'Allowed slowdown, as a fraction (0.10 = 10%)'
-        default: '0.10'
+        description: 'Allowed slowdown, as a fraction (0.05 = 5%)'
+        default: '0.05'
       enforce:
         description: 'Fail the job on a regression'
         type: boolean
-        default: false
+        default: true
 
 # A newer push to a pull request replaces its run, but runs on main are never
 # cancelled by a later merge, so each merge keeps its own result (GitHub still
@@ -116,8 +122,10 @@ jobs:
       BASE: ${{ github.event.pull_request.base.sha || github.event.before || inputs.base_ref }}
       SIZE_MB: ${{ inputs.size_mb || '1024' }}
       REPEATS: ${{ inputs.repeats || '5' }}
-      THRESHOLD: ${{ inputs.threshold || '0.10' }}
-      ENFORCE: ${{ inputs.enforce || 'false' }}
+      THRESHOLD: ${{ inputs.threshold || '0.05' }}
+      # Fail on a regression everywhere, except a manual run that turned it off.
+      # (format() because a boolean false would fall through the || below.)
+      ENFORCE: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.enforce) || 'true' }}
 
     steps:
       - uses: actions/checkout@v5
@@ -189,12 +197,17 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           fail=""
           if [ "$ENFORCE" = "true" ]; then fail="--fail"; fi
+          echo "Fail on regression: ${ENFORCE}." >> "$GITHUB_STEP_SUMMARY"
           set +e
           python3 bench/compare.py bench-results.json \
             --base base --pr pr --reference pg_dump \
             --threshold "$THRESHOLD" $fail | tee report.md
           status=${PIPESTATUS[0]}
           cat report.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            what=$(grep -m1 'Possible regression' report.md | sed 's/\*//g')
+            echo "::error title=Benchmark::${what:-compare.py failed} See the job summary."
+          fi
           exit $status
 
       - uses: actions/upload-artifact@v4

@@ -41,7 +41,7 @@ def main() -> None:
     ap.add_argument("--base", required=True, help="variant name of the baseline build")
     ap.add_argument("--pr", required=True, help="variant name of the build under test")
     ap.add_argument("--reference", default=None, help="variant name shown as a ratio only")
-    ap.add_argument("--threshold", type=float, default=0.10, help="allowed slowdown (0.10 = 10%%)")
+    ap.add_argument("--threshold", type=float, default=0.05, help="allowed slowdown (0.05 = 5%%)")
     ap.add_argument("--min-abs", type=float, default=0.2, help="ignore slowdowns under N seconds")
     ap.add_argument("--fail", action="store_true", help="exit 1 on regression")
     args = ap.parse_args()
