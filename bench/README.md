@@ -81,7 +81,7 @@ because they flatter the disk-bound restore phase.
 - `--keep-fsync` leaves `fsync` on (realistic disk behaviour, noisier).
 - `--no-stabilize` leaves the server settings completely alone.
 
-`compare.py` flags a build that is slower than the base by more than 10%
+`compare.py` flags a build that is slower than the base by more than 5%
 and by more than 0.2s (`--threshold` and `--min-abs`), using the median of
 the measured rounds.
 
