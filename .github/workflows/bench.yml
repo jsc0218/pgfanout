@@ -47,8 +47,10 @@ name: Benchmark
 #   * on demand (workflow_dispatch).
 # There is deliberately no schedule trigger.
 #
-# It is advisory by default: it fails only when "enforce" is turned on
-# (workflow_dispatch).
+# It fails the job when a regression is found (the report is still written to
+# the job summary, and uploaded, first). A manual run can turn that off with
+# the "enforce" input. Whether a failed run also blocks merging is a branch
+# protection setting: it does only if this check is made a required one.
 on:
   pull_request:
     paths:
@@ -80,7 +82,7 @@ on:
       enforce:
         description: 'Fail the job on a regression'
         type: boolean
-        default: false
+        default: true
 
 # A newer push to a pull request replaces its run, but runs on main are never
 # cancelled by a later merge, so each merge keeps its own result (GitHub still
@@ -121,7 +123,9 @@ jobs:
       SIZE_MB: ${{ inputs.size_mb || '1024' }}
       REPEATS: ${{ inputs.repeats || '5' }}
       THRESHOLD: ${{ inputs.threshold || '0.05' }}
-      ENFORCE: ${{ inputs.enforce || 'false' }}
+      # Fail on a regression everywhere, except a manual run that turned it off.
+      # (format() because a boolean false would fall through the || below.)
+      ENFORCE: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.enforce) || 'true' }}
 
     steps:
       - uses: actions/checkout@v5
@@ -193,12 +197,17 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           fail=""
           if [ "$ENFORCE" = "true" ]; then fail="--fail"; fi
+          echo "Fail on regression: ${ENFORCE}. Threshold: ${THRESHOLD}." >> "$GITHUB_STEP_SUMMARY"
           set +e
           python3 bench/compare.py bench-results.json \
             --base base --pr pr --reference pg_dump \
             --threshold "$THRESHOLD" $fail | tee report.md
           status=${PIPESTATUS[0]}
           cat report.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            what=$(grep -m1 'Possible regression' report.md | sed 's/\*//g')
+            echo "::error title=Benchmark::${what:-compare.py failed} See the job summary."
+          fi
           exit $status
 
       - uses: actions/upload-artifact@v4
