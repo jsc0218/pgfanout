@@ -318,12 +318,18 @@ class _S3MultipartWriter:
             raise ValueError("write() after close")
         if not data:
             return 0
-        self._buf.extend(data)
-        # Flush full parts while buffer has enough bytes; keep the tail
-        # in the buffer so it can grow past part_size before the next
-        # upload_part call.
-        while len(self._buf) >= self._part_size:
-            self._flush_part(self._part_size)
+        # Feed the buffer one part at a time instead of appending all of *data*
+        # first, so a large write cannot grow it past part_size. Part boundaries
+        # are the same as before; a short tail stays in the buffer until the
+        # next write or close.
+        with memoryview(data) as view:
+            pos = 0
+            while pos < len(view):
+                take = min(self._part_size - len(self._buf), len(view) - pos)
+                self._buf.extend(view[pos : pos + take])
+                pos += take
+                if len(self._buf) >= self._part_size:
+                    self._flush_part(self._part_size)
         return len(data)
 
     def _upload_part(self, part_number: int, body: bytes) -> dict:
@@ -341,20 +347,25 @@ class _S3MultipartWriter:
         self._parts.append(self._pending.popleft().result())
 
     def _flush_part(self, size: int) -> None:
-        body = bytes(self._buf[:size])
+        if self._pool is not None:
+            # Make room *before* copying the part: collect finished uploads so a
+            # failure shows up early, then wait for the oldest if every slot is
+            # busy. Copying first would hold one more part than the documented
+            # bound (part_size * (threads + 1)) while blocked.
+            while self._pending and self._pending[0].done():
+                self._reap_oldest()
+            while len(self._pending) >= self._upload_threads:
+                self._reap_oldest()
+        # One copy of the part (the views are released before the buffer shrinks).
+        with memoryview(self._buf) as view, view[:size] as part:
+            body = bytes(part)
         del self._buf[:size]
         part_number = self._next_part_num
         self._next_part_num += 1
         if self._pool is None:
             self._parts.append(self._upload_part(part_number, body))
-            return
-        # Collect finished uploads first so a failure shows up early, then wait
-        # for the oldest one if the in-flight limit is reached.
-        while self._pending and self._pending[0].done():
-            self._reap_oldest()
-        while len(self._pending) >= self._upload_threads:
-            self._reap_oldest()
-        self._pending.append(self._pool.submit(self._upload_part, part_number, body))
+        else:
+            self._pending.append(self._pool.submit(self._upload_part, part_number, body))
 
     def _drain(self) -> None:
         """Wait for every in-flight part (in order), raising the first failure."""
@@ -362,11 +373,37 @@ class _S3MultipartWriter:
             self._reap_oldest()
 
     def _stop_uploads(self) -> None:
-        """Let uploads already on the wire finish, and run no further ones."""
-        if self._pool is not None:
-            self._pool.shutdown(wait=True, cancel_futures=True)
-            self._pool = None
+        """Let uploads already on the wire finish, and run no further ones.
+
+        An interrupt (Ctrl-C) while waiting does not cut the wait short: the
+        wait is finished and the interrupt is re-raised afterwards. That keeps
+        the caller's abort from racing a part that is still being sent.
+        """
+        pool, self._pool = self._pool, None
+        interrupt: BaseException | None = None
+        if pool is not None:
+            while True:
+                try:
+                    pool.shutdown(wait=True, cancel_futures=True)
+                    break
+                except BaseException as exc:  # noqa: BLE001
+                    interrupt = interrupt or exc
         self._pending.clear()
+        if interrupt is not None:
+            raise interrupt
+
+    def _abort_once_uploads_finish(self) -> None:
+        """Failure cleanup: wait for in-flight parts, then abort the upload.
+
+        Never raises (apart from the abort call itself), so the failure being
+        handled is the one the caller sees, and the abort always runs, and runs
+        only after no part is still on the wire.
+        """
+        try:
+            self._stop_uploads()
+        except BaseException:  # noqa: BLE001, S110 - superseded by the failure in progress
+            pass
+        self._best_effort_abort()
 
     def _best_effort_abort(self) -> None:
         """Tear down the multipart upload so dangling parts don't accrue charges.
@@ -399,8 +436,7 @@ class _S3MultipartWriter:
             # charged storage for an aborted upload. Uploads already on the
             # wire finish first: a part that lands after the abort would
             # otherwise be left behind.
-            self._stop_uploads()
-            self._best_effort_abort()
+            self._abort_once_uploads_finish()
             return False  # let the exception propagate
 
         # Happy-path finalisation.  Any failure here (trailing flush,
@@ -445,8 +481,7 @@ class _S3MultipartWriter:
                 MultipartUpload={"Parts": self._parts},
             )
         except BaseException:
-            self._stop_uploads()
-            self._best_effort_abort()
+            self._abort_once_uploads_finish()
             raise
         finally:
             self._stop_uploads()  # releases the upload threads; a no-op if done

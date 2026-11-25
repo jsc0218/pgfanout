@@ -1216,3 +1216,101 @@ def test_s3_upload_threads_env(monkeypatch):
         monkeypatch.setenv(storage.S3_UPLOAD_THREADS_ENV, bad)
         with pytest.raises(ValueError, match=storage.S3_UPLOAD_THREADS_ENV):
             S3Blob("b", "k", client=object())
+
+
+def test_s3_memory_is_bounded_when_all_upload_slots_are_busy(monkeypatch):
+    """With every slot busy the writer must block *before* copying another part.
+
+    The documented bound is part_size * (threads + 1); an extra slice and copy
+    taken before the wait used to push the peak to about five parts.
+    """
+    import threading
+    import tracemalloc
+
+    from pgfanout import storage
+
+    monkeypatch.setattr(storage, "S3_MIN_PART_SIZE", 1)
+    part, threads, chunk = 1 << 20, 2, 64 << 10
+    gate = threading.Event()  # closed: uploads never finish, so the slots stay full
+    client = _FakeS3(gate=gate)
+    blob = S3Blob("b", "k", client=client, part_size=part, upload_threads=threads)
+    writer = blob.open_write()
+    sink = writer.__enter__()
+    finished = threading.Event()
+
+    def feed():
+        for _ in range(8 * (part // chunk)):  # 8 parts' worth, so it must block
+            sink.write(b"\0" * chunk)
+        finished.set()
+
+    tracemalloc.start()
+    t = threading.Thread(target=feed)
+    t.start()
+    try:
+        assert not finished.wait(1.5), "the writer should be blocked on full upload slots"
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+        gate.set()
+        t.join(10)
+        writer.__exit__(None, None, None)
+    assert peak <= (threads + 1.5) * part, f"peak {peak / part:.1f} parts, expected <= 3.5"
+
+
+def test_s3_one_huge_write_does_not_buffer_the_whole_write(monkeypatch):
+    """A single write much larger than a part is cut into parts as it goes."""
+    import threading
+    import tracemalloc
+
+    from pgfanout import storage
+
+    monkeypatch.setattr(storage, "S3_MIN_PART_SIZE", 1)
+    part = 1 << 20
+    gate = threading.Event()
+    client = _FakeS3(gate=gate)
+    blob = S3Blob("b", "k", client=client, part_size=part, upload_threads=1)
+    writer = blob.open_write()
+    sink = writer.__enter__()
+    big = bytes(16 * part)
+    tracemalloc.start()
+    t = threading.Thread(target=lambda: sink.write(big))
+    t.start()
+    try:
+        t.join(1.5)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+        gate.set()
+        t.join(10)
+        writer.__exit__(None, None, None)
+    # one part filling + one in flight, never the 16 parts of the write
+    assert peak <= 3.5 * part, f"peak {peak / part:.1f} parts"
+
+
+def test_s3_interrupt_while_stopping_uploads_still_aborts_and_keeps_the_error(tiny_part_size):
+    """A Ctrl-C during the wait must not skip the abort or hide the original error."""
+    import threading
+
+    gate = threading.Event()
+    client = _FakeS3(gate=gate, delay=0.01)
+    blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=2)
+    interrupted = []
+    with pytest.raises(ValueError, match="original failure"):
+        with blob.open_write() as sink:
+            sink.write(b"x" * 40)  # parts are now in flight, held by the gate
+            real_shutdown = sink._pool.shutdown
+
+            def interrupted_shutdown(*a, **kw):
+                if not interrupted:
+                    interrupted.append(True)
+                    threading.Timer(0.2, gate.set).start()  # uploads finish shortly
+                    raise KeyboardInterrupt  # as if Ctrl-C landed during the wait
+                return real_shutdown(*a, **kw)
+
+            sink._pool.shutdown = interrupted_shutdown
+            raise ValueError("original failure")
+    assert interrupted
+    assert client.in_flight == 0  # the abort waited for the uploads
+    assert client.events.count("abort") == 1
+    assert client.events[-1] == "abort"
+    assert client.completed is None
