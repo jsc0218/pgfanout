@@ -29,6 +29,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import statistics
 import subprocess
@@ -155,13 +156,45 @@ def s3_client():
         import boto3
     except ImportError:
         sys.exit("--storage needs boto3: run bench.py with the Python of a pgfanout install")
-    return boto3.client(
-        "s3",
-        endpoint_url=os.environ.get("AWS_ENDPOINT_URL_S3")
+    kwargs: dict = {
+        "service_name": "s3",
+        "endpoint_url": os.environ.get("AWS_ENDPOINT_URL_S3")
         or os.environ.get("AWS_S3_ENDPOINT_URL")
         or None,
-        region_name=os.environ.get("AWS_REGION") or "us-east-1",
-    )
+        "region_name": os.environ.get("AWS_REGION") or "us-east-1",
+    }
+    # AWS_S3_VERIFY_SSL, resolved the way pgfanout does: a boolean, or a CA bundle path.
+    raw = (os.environ.get("AWS_S3_VERIFY_SSL") or "").strip()
+    if raw:
+        if raw.lower() in ("0", "false", "no", "off"):
+            kwargs["verify"] = False
+        elif raw.lower() not in ("1", "true", "yes", "on"):
+            kwargs["verify"] = raw
+    return boto3.client(**kwargs)
+
+
+def s3_preflight(base_uri: str) -> None:
+    """Fail early if the bucket is missing, and refuse a versioned one.
+
+    In a versioned bucket a plain delete only adds a delete marker and keeps
+    the dump data, so the cleanup this harness promises would not hold.
+    """
+    from botocore.exceptions import ClientError
+
+    bucket, _ = s3_split(base_uri)
+    try:
+        status = s3_client().get_bucket_versioning(Bucket=bucket).get("Status")
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchBucket", "404"):
+            sys.exit(f"bucket {bucket!r} does not exist")
+        print(f"warning: could not check versioning of {bucket!r}: {code}", file=sys.stderr)
+        return
+    if status in ("Enabled", "Suspended"):
+        sys.exit(
+            f"bucket {bucket!r} has versioning {status.lower()}: deleting the test objects "
+            "would only leave delete markers and keep the dump data. Use an unversioned bucket."
+        )
 
 
 def s3_bytes(uri: str) -> int:
@@ -175,17 +208,30 @@ def s3_bytes(uri: str) -> int:
 
 def s3_clear(uri: str) -> None:
     """Delete every object under *uri*, and abort any unfinished multipart upload."""
+    from botocore.exceptions import ClientError
+
     bucket, prefix = s3_split(uri)
     client = s3_client()
+    # A delete can succeed overall yet fail for single keys, so keep going and
+    # report everything that was left behind at the end.
+    errors: list[str] = []
     pages = client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
     for page in pages:
         keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
         if keys:
-            client.delete_objects(Bucket=bucket, Delete={"Objects": keys, "Quiet": True})
+            resp = client.delete_objects(Bucket=bucket, Delete={"Objects": keys, "Quiet": True})
+            errors += [f"{e.get('Key')}: {e.get('Code')}" for e in resp.get("Errors", [])]
     pages = client.get_paginator("list_multipart_uploads").paginate(Bucket=bucket, Prefix=prefix)
     for page in pages:
         for up in page.get("Uploads", []):
-            client.abort_multipart_upload(Bucket=bucket, Key=up["Key"], UploadId=up["UploadId"])
+            try:
+                client.abort_multipart_upload(Bucket=bucket, Key=up["Key"], UploadId=up["UploadId"])
+            except ClientError as exc:
+                errors.append(f"{up['Key']}: abort failed ({exc.response['Error']['Code']})")
+    if errors:
+        raise RuntimeError(
+            f"{len(errors)} S3 object(s) under {uri} could not be removed, e.g. {errors[0]}"
+        )
 
 
 def generate_dataset(conn: dict[str, str], size_mb: int) -> dict:
@@ -450,12 +496,18 @@ def main() -> None:
     if args.sweep is None and any(v[3] for v in variants):
         ap.error("NAME=...@JOBS pins a variant's job count and needs --jobs-sweep")
     if args.storage is not None:
-        if not re.fullmatch(r"s3://[^/\s]+(/\S*)?", args.storage):
-            ap.error("--storage must look like s3://BUCKET/PREFIX")
+        # No '?' or '#' (pgfanout would parse them as a query or fragment and drop
+        # the rest) and no extra leading slash (it strips those, this harness would not).
+        if not re.fullmatch(r"s3://[^/\s?#]+(?:/(?!/)[^\s?#]*)?", args.storage):
+            ap.error(
+                "--storage must look like s3://BUCKET/PREFIX, with no '?', '#' or '//' after the bucket"
+            )
         if any(v[1] == "pgdump" for v in variants):
             ap.error("--storage only works with pgfanout variants; pg_dump cannot write to S3")
         # A prefix of our own, so a leftover or concurrent run is never touched.
-        args.storage_run = f"{args.storage.rstrip('/')}/bench-{int(time.time())}-{os.getpid()}"
+        # Random, so two runs on different hosts can never share a prefix.
+        args.storage_run = f"{args.storage.rstrip('/')}/bench-{secrets.token_hex(8)}"
+        s3_preflight(args.storage_run)
     else:
         args.storage_run = None
     conn = env_conn()

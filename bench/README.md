@@ -84,9 +84,12 @@ python3 bench/sweep_report.py s3-sweep.json
   `boto3`. The endpoint, region and credentials come from the same `AWS_*`
   variables pgfanout reads (see the README's S3 section).
 - Only pgfanout variants work: `pg_dump` cannot write to S3.
-- Every run writes under its own `PREFIX/bench-<time>-<pid>/` and deletes it
+- Every run writes under its own random `PREFIX/bench-<id>/` and deletes it
   afterwards, including unfinished multipart uploads, so it never touches
-  other objects. If a run is killed, delete that prefix by hand.
+  other objects. If a run is killed, delete that prefix by hand. Use an
+  **unversioned** bucket: in a versioned one a delete only adds a marker and
+  keeps the data, so the harness refuses it. `PREFIX` must not contain `?`, `#`
+  or a leading `//`.
 - Run it from an instance in the bucket's region, reaching S3 through a VPC
   gateway endpoint. Through a NAT gateway you pay per GB, and a large sweep
   moves hundreds of GB.
