@@ -1368,3 +1368,43 @@ def test_s3_interrupt_while_stopping_uploads_is_reraised_without_an_original_err
             t.cancel()
         gate.set()
     assert client.in_flight == 0  # the wait ran to the end before re-raising
+
+
+def test_s3_interrupt_before_the_wait_starts_still_aborts_after_uploads_finish(tiny_part_size):
+    """An interrupt in the first, non-blocking step of stopping must not skip the wait.
+
+    The step that cancels queued parts runs before any blocking wait, and an
+    interrupt there used to escape with the pool and the pending parts already
+    forgotten, so the abort ran while uploads were still on the wire.
+    """
+    gate = threading.Event()
+    client = _FakeS3(gate=gate)
+    blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=2)
+    interrupted = []
+    timer = threading.Timer(0.5, gate.set)  # uploads finish well after the interrupt
+    try:
+        with pytest.raises(ValueError, match="original failure"):
+            with blob.open_write() as sink:
+                sink.write(b"x" * 40)
+                deadline = time.monotonic() + 5
+                while client.in_flight < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert client.in_flight == 2
+                real_shutdown = sink._pool.shutdown
+
+                def shutdown(*a, **kw):
+                    if not interrupted:
+                        interrupted.append(True)
+                        timer.start()
+                        raise KeyboardInterrupt  # lands in the non-blocking step
+                    return real_shutdown(*a, **kw)
+
+                sink._pool.shutdown = shutdown
+                raise ValueError("original failure")
+    finally:
+        timer.cancel()
+        gate.set()
+    assert interrupted
+    assert client.in_flight_at_abort == [0]
+    assert client.events[-1] == "abort"
+    assert client.completed is None

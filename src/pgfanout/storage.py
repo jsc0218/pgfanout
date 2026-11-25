@@ -380,26 +380,30 @@ class _S3MultipartWriter:
         wait is finished and the interrupt is re-raised afterwards. That keeps
         the caller's abort from racing a part that is still being sent.
         """
-        pool, self._pool = self._pool, None
+        pool = self._pool
         pending = list(self._pending)
-        self._pending.clear()
         interrupt: BaseException | None = None
         if pool is not None:
-            # Drop parts that have not started; the ones on the wire are waited
-            # for below. Wait on the futures, not on Thread.join: on Python 3.10
-            # a join that is interrupted by Ctrl-C marks the thread finished
-            # while it is still running, so a retried shutdown() returns early.
-            pool.shutdown(wait=False, cancel_futures=True)
-            # A cancelled future never runs, and on 3.10 its waiters are never
-            # woken, so only the uploads that are actually running are waited on.
-            running = [f for f in pending if not f.cancelled()]
+            # Every step is inside the loop, so an interrupt at any point is kept
+            # and the step is simply run again; only then is the state cleared.
+            #
+            # Wait on the futures, not on Thread.join: on Python 3.10 a join that
+            # is interrupted by Ctrl-C marks the thread finished while it is still
+            # running, so a retried shutdown() would return early.
             while True:
                 try:
-                    wait_futures(running)
+                    for future in pending:
+                        future.cancel()  # parts that have not started; a running one refuses
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    # A cancelled future never runs, and on 3.10 its waiters are never
+                    # woken, so only the uploads that are actually running are waited on.
+                    wait_futures([f for f in pending if not f.cancelled()])
                     pool.shutdown(wait=True)  # nothing left to wait for, only the threads exit
                     break
                 except BaseException as exc:  # noqa: BLE001
                     interrupt = interrupt or exc
+        self._pool = None
+        self._pending.clear()
         if interrupt is not None:
             raise interrupt
 
