@@ -25,6 +25,7 @@ import tempfile
 from abc import ABC, abstractmethod
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, BinaryIO
 from urllib.parse import urlparse
@@ -380,15 +381,25 @@ class _S3MultipartWriter:
         the caller's abort from racing a part that is still being sent.
         """
         pool, self._pool = self._pool, None
+        pending = list(self._pending)
+        self._pending.clear()
         interrupt: BaseException | None = None
         if pool is not None:
+            # Drop parts that have not started; the ones on the wire are waited
+            # for below. Wait on the futures, not on Thread.join: on Python 3.10
+            # a join that is interrupted by Ctrl-C marks the thread finished
+            # while it is still running, so a retried shutdown() returns early.
+            pool.shutdown(wait=False, cancel_futures=True)
+            # A cancelled future never runs, and on 3.10 its waiters are never
+            # woken, so only the uploads that are actually running are waited on.
+            running = [f for f in pending if not f.cancelled()]
             while True:
                 try:
-                    pool.shutdown(wait=True, cancel_futures=True)
+                    wait_futures(running)
+                    pool.shutdown(wait=True)  # nothing left to wait for, only the threads exit
                     break
                 except BaseException as exc:  # noqa: BLE001
                     interrupt = interrupt or exc
-        self._pending.clear()
         if interrupt is not None:
             raise interrupt
 

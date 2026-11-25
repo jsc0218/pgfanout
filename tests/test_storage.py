@@ -8,6 +8,9 @@ returns canned responses).
 
 import io
 import os
+import signal
+import threading
+import time
 
 import boto3
 import pytest
@@ -1052,6 +1055,7 @@ class _FakeS3:
         self.events: list[str] = []
         self.in_flight = 0
         self.max_in_flight = 0
+        self.in_flight_at_abort: list[int] = []
         self.upload_threads: set[str] = set()
         self.completed = None
         self.objects: dict[str, bytes] = {}
@@ -1092,6 +1096,7 @@ class _FakeS3:
     def abort_multipart_upload(self, **kw):
         with self.lock:
             self.events.append("abort")
+            self.in_flight_at_abort.append(self.in_flight)
         return {}
 
     def put_object(self, *, Key, Body, **kw):
@@ -1287,30 +1292,79 @@ def test_s3_one_huge_write_does_not_buffer_the_whole_write(monkeypatch):
     assert peak <= 3.5 * part, f"peak {peak / part:.1f} parts"
 
 
+_MAIN_THREAD_ID = threading.get_ident()
+
+
+def _sigint_main_thread():
+    """Deliver a real SIGINT to the main thread, so a blocked wait there is interrupted.
+
+    ``_thread.interrupt_main`` only sets a flag and does not wake a thread that is
+    blocked waiting, so it would fire after the wait rather than during it.
+    """
+    signal.pthread_kill(_MAIN_THREAD_ID, signal.SIGINT)
+
+
 def test_s3_interrupt_while_stopping_uploads_still_aborts_and_keeps_the_error(tiny_part_size):
-    """A Ctrl-C during the wait must not skip the abort or hide the original error."""
+    """A Ctrl-C during the wait must not skip the abort or hide the original error.
+
+    The interrupt is delivered to the main thread while ``shutdown(wait=True)``
+    is genuinely blocked on uploads that are held by a gate, so the wait itself
+    is what gets interrupted, and the abort must still come after every part
+    has finished.
+    """
     import threading
 
     gate = threading.Event()
-    client = _FakeS3(gate=gate, delay=0.01)
+    client = _FakeS3(gate=gate)
     blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=2)
-    interrupted = []
-    with pytest.raises(ValueError, match="original failure"):
-        with blob.open_write() as sink:
-            sink.write(b"x" * 40)  # parts are now in flight, held by the gate
-            real_shutdown = sink._pool.shutdown
-
-            def interrupted_shutdown(*a, **kw):
-                if not interrupted:
-                    interrupted.append(True)
-                    threading.Timer(0.2, gate.set).start()  # uploads finish shortly
-                    raise KeyboardInterrupt  # as if Ctrl-C landed during the wait
-                return real_shutdown(*a, **kw)
-
-            sink._pool.shutdown = interrupted_shutdown
-            raise ValueError("original failure")
-    assert interrupted
-    assert client.in_flight == 0  # the abort waited for the uploads
+    timers = [
+        threading.Timer(0.3, _sigint_main_thread),  # lands inside the wait
+        threading.Timer(0.8, gate.set),  # uploads finish after the interrupt
+    ]
+    try:
+        with pytest.raises(ValueError, match="original failure"):
+            with blob.open_write() as sink:
+                sink.write(b"x" * 40)  # parts are in flight, held by the gate
+                deadline = time.monotonic() + 5
+                while client.in_flight < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert client.in_flight == 2
+                for t in timers:
+                    t.start()
+                raise ValueError("original failure")
+    finally:
+        for t in timers:
+            t.cancel()
+        gate.set()
+    assert client.in_flight_at_abort == [0]  # nothing was on the wire at abort
     assert client.events.count("abort") == 1
     assert client.events[-1] == "abort"
     assert client.completed is None
+
+
+def test_s3_interrupt_while_stopping_uploads_is_reraised_without_an_original_error(tiny_part_size):
+    """With nothing else failing, the interrupt itself reaches the caller, after the abort."""
+    import threading
+
+    gate = threading.Event()
+    client = _FakeS3(gate=gate)
+    blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=2)
+    timers = [
+        threading.Timer(0.3, _sigint_main_thread),
+        threading.Timer(0.8, gate.set),
+    ]
+    sink = blob.open_write().__enter__()
+    try:
+        sink.write(b"x" * 40)
+        deadline = time.monotonic() + 5
+        while client.in_flight < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        for t in timers:
+            t.start()
+        with pytest.raises(KeyboardInterrupt):
+            sink._stop_uploads()
+    finally:
+        for t in timers:
+            t.cancel()
+        gate.set()
+    assert client.in_flight == 0  # the wait ran to the end before re-raising
