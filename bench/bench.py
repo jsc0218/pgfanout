@@ -29,6 +29,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import statistics
 import subprocess
@@ -140,6 +141,118 @@ def psql(conn: dict[str, str], db: str, sql: str) -> str:
 
 def dir_bytes(path: Path) -> int:
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def s3_split(uri: str) -> tuple[str, str]:
+    """('s3://bucket/some/prefix') -> ('bucket', 'some/prefix/')."""
+    bucket, _, prefix = uri[len("s3://") :].partition("/")
+    return bucket, (prefix.rstrip("/") + "/") if prefix else ""
+
+
+def s3_client():
+    # boto3 is only needed for --storage, so import it lazily. The endpoint
+    # and region follow the same variables pgfanout reads (see its README).
+    try:
+        import boto3
+    except ImportError:
+        sys.exit("--storage needs boto3: run bench.py with the Python of a pgfanout install")
+    kwargs: dict = {
+        "service_name": "s3",
+        "endpoint_url": os.environ.get("AWS_ENDPOINT_URL_S3")
+        or os.environ.get("AWS_S3_ENDPOINT_URL")
+        or None,
+        "region_name": os.environ.get("AWS_REGION") or "us-east-1",
+    }
+    # AWS_S3_VERIFY_SSL, resolved exactly the way pgfanout does (make_s3_client): a
+    # boolean, or a CA bundle path. A true value is passed explicitly, so it means
+    # the default trust store here as in pgfanout, and not whatever AWS_CA_BUNDLE
+    # or a profile would pick; otherwise the preflight could pass on a bundle the
+    # dump does not use.
+    raw = os.environ.get("AWS_S3_VERIFY_SSL")
+    if raw is not None and raw != "":
+        flag = raw.strip().lower()
+        if flag in ("0", "false", "no", "off"):
+            kwargs["verify"] = False
+        elif flag in ("1", "true", "yes", "on"):
+            kwargs["verify"] = True
+        else:
+            kwargs["verify"] = raw  # anything else is a CA bundle path
+    return boto3.client(**kwargs)
+
+
+def s3_preflight(base_uri: str) -> None:
+    """Fail early if the bucket is missing, and refuse a versioned one.
+
+    In a versioned bucket a plain delete only adds a delete marker and keeps
+    the dump data, so the cleanup this harness promises would not hold.
+    """
+    # Build the client first: it gives the readable "needs boto3" error if boto3
+    # is missing, before botocore is imported below.
+    client = s3_client()
+    from botocore.exceptions import ClientError
+
+    bucket, _ = s3_split(base_uri)
+    try:
+        status = client.get_bucket_versioning(Bucket=bucket).get("Status")
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchBucket", "404"):
+            sys.exit(f"bucket {bucket!r} does not exist")
+        print(f"warning: could not check versioning of {bucket!r}: {code}", file=sys.stderr)
+        return
+    if status in ("Enabled", "Suspended"):
+        sys.exit(
+            f"bucket {bucket!r} has versioning {status.lower()}: deleting the test objects "
+            "would only leave delete markers and keep the dump data. Use an unversioned bucket."
+        )
+
+
+def s3_bytes(uri: str) -> int:
+    bucket, prefix = s3_split(uri)
+    total = 0
+    pages = s3_client().get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
+    for page in pages:
+        total += sum(o["Size"] for o in page.get("Contents", []))
+    return total
+
+
+def s3_clear(uri: str) -> None:
+    """Delete every object under *uri*, and abort any unfinished multipart upload."""
+    client = s3_client()  # first, for the readable error if boto3 is missing
+    from botocore.exceptions import ClientError
+
+    bucket, prefix = s3_split(uri)
+    # The two phases are independent: a failure in one (a denied or failed request,
+    # or a delete that succeeds overall yet fails for single keys) must not stop
+    # the other, and everything left behind is reported together at the end.
+    errors: list[str] = []
+    try:
+        pages = client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
+        for page in pages:
+            keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+            if keys:
+                resp = client.delete_objects(Bucket=bucket, Delete={"Objects": keys, "Quiet": True})
+                errors += [f"{e.get('Key')}: {e.get('Code')}" for e in resp.get("Errors", [])]
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"deleting objects failed: {exc}")
+    try:
+        pages = client.get_paginator("list_multipart_uploads").paginate(
+            Bucket=bucket, Prefix=prefix
+        )
+        for page in pages:
+            for up in page.get("Uploads", []):
+                try:
+                    client.abort_multipart_upload(
+                        Bucket=bucket, Key=up["Key"], UploadId=up["UploadId"]
+                    )
+                except ClientError as exc:
+                    errors.append(f"{up['Key']}: abort failed ({exc.response['Error']['Code']})")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"aborting multipart uploads failed: {exc}")
+    if errors:
+        raise RuntimeError(
+            f"{len(errors)} S3 object(s) under {uri} could not be removed, e.g. {errors[0]}"
+        )
 
 
 def generate_dataset(conn: dict[str, str], size_mb: int) -> dict:
@@ -271,7 +384,7 @@ def verify(conn: dict[str, str], expected: dict[str, int], variant: str) -> None
             sys.exit(f"{variant}: {table} has {got} rows after restore, expected {want}")
 
 
-def pgfanout_cmds(bindir: str, conn: dict[str, str], jobs: int, out: Path, config: Path):
+def pgfanout_cmds(bindir: str, conn: dict[str, str], jobs: int, out: Path | str, config: Path):
     # An explicit (empty) config file stops pgfanout from picking up a
     # ./pgfanout.toml or ~/.config/pgfanout/pgfanout.toml, which could change
     # the table, the unlogged mode or the part count being measured.
@@ -368,6 +481,15 @@ def main() -> None:
         help="leave fsync on (realistic disk behaviour, noisier). By default fsync is "
         "turned off, for a server on this machine only",
     )
+    ap.add_argument(
+        "--storage",
+        default=None,
+        metavar="s3://BUCKET/PREFIX",
+        help="write the dump to S3 (or an S3-compatible store) instead of local disk and "
+        "restore from it. Only pgfanout variants can do this. Each run uses its own "
+        "unique prefix under PREFIX and deletes it afterwards. Credentials, endpoint "
+        "and region come from the usual AWS_* environment variables",
+    )
     ap.add_argument("--workdir", default=None, help="where dumps are written (default: temp dir)")
     ap.add_argument("--out", default="bench-results.json")
     args = ap.parse_args()
@@ -394,6 +516,23 @@ def main() -> None:
         ap.error("variant names must be unique")
     if args.sweep is None and any(v[3] for v in variants):
         ap.error("NAME=...@JOBS pins a variant's job count and needs --jobs-sweep")
+    if args.storage is not None:
+        # No '?' or '#' (pgfanout would parse them as a query or fragment and drop
+        # the rest) and no extra leading slash (it strips those, this harness would not).
+        if not re.fullmatch(r"s3://[^/\s?#]+(?:/(?!/)[^\s?#]*)?", args.storage):
+            ap.error(
+                "--storage must look like s3://BUCKET/PREFIX, with no '?', '#' or '//' after the bucket"
+            )
+        if any(v[1] == "pgdump" for v in variants):
+            ap.error("--storage only works with pgfanout variants; pg_dump cannot write to S3")
+        # A prefix of our own, so a leftover or concurrent run is never touched.
+        # Random, so two runs on different hosts can never share a prefix.
+        args.storage_run = f"{args.storage.rstrip('/')}/bench-{secrets.token_hex(8)}"
+        s3_preflight(args.storage_run)
+        # Printed (and flushed) up front so a killed run can still be cleaned up by hand.
+        print(f"S3 run prefix: {args.storage_run}/", flush=True)
+    else:
+        args.storage_run = None
     conn = env_conn()
     env = {**os.environ, "PGPASSWORD": conn["password"]}
 
@@ -410,10 +549,13 @@ def main() -> None:
         print(f"note: leaving fsync on, {conn['host']!r} is not a local server", file=sys.stderr)
     originals = read_overrides(conn) if not args.no_stabilize else {}
     touched: list[str] = []
+    benchmark_ok = False
+    s3_cleanup_failure: BaseException | None = None
     try:
         if not args.no_stabilize:
             stabilize_server(conn, args.size_mb, fsync_off, touched)
         data, results = run_benchmark(args, variants, conn, env, workroot, empty_config)
+        benchmark_ok = True
     finally:
         # Runs on success, failure and Ctrl-C alike, and must not hide the
         # original error if cleanup itself fails.
@@ -422,14 +564,23 @@ def main() -> None:
             ("restore server settings", lambda: restore_server(conn, originals, touched)),
         ]
         if "fsync" in touched:
+            # Straight after fsync is back on, and before anything that talks to
+            # the network: until this runs, the data written with fsync off is not
+            # durable, and a crash in that window can corrupt the cluster. The S3
+            # cleanup below can be slow (many objects, retries, a hung connection).
             cleanup.append(
                 ("flush data written with fsync off", lambda: flush_after_fsync_off(conn))
             )
+        s3_label = "delete the S3 test objects"
+        if args.storage_run:
+            cleanup.append((s3_label, lambda: s3_clear(args.storage_run)))
         for label, step in cleanup:
             try:
                 step()
             except BaseException as exc:  # noqa: BLE001
                 print(f"warning: could not {label}: {exc}", file=sys.stderr)
+                if label == s3_label:
+                    s3_cleanup_failure = exc
         if not args.workdir:
             shutil.rmtree(workroot, ignore_errors=True)
 
@@ -441,6 +592,7 @@ def main() -> None:
         "fsync_off": fsync_off,
         "jobs": max(args.sweep) if args.sweep else args.jobs,
         "jobs_sweep": args.sweep,
+        "storage": "s3" if args.storage else "local",
         "cpus": os.cpu_count(),
         "cpu_info": cpu_info(),
         "platform": platform.platform(),
@@ -453,6 +605,14 @@ def main() -> None:
         r["restore_median_s"] = round(statistics.median(r["restore_s"]), 3)
     Path(args.out).write_text(json.dumps({"meta": meta, "results": results}, indent=2) + "\n")
     print(f"Wrote {args.out}")
+    # Objects left in S3 cost money, so a successful run must not hide that. The
+    # results are saved first (they can take hours to produce), then this fails.
+    # If the benchmark itself failed, that error is the one that propagates.
+    if benchmark_ok and s3_cleanup_failure is not None:
+        sys.exit(
+            f"error: the benchmark finished but the S3 cleanup failed: {s3_cleanup_failure}\n"
+            f"Delete {args.storage_run}/ by hand."
+        )
 
 
 def drop_databases(conn: dict[str, str]) -> None:
@@ -488,10 +648,15 @@ def run_benchmark(args, variants, conn, env, workroot: Path, empty_config: Path)
         shift = rnd % len(combos)
         order = combos[shift:] + combos[:shift]
         for name, kind, arg, jobs in order:
-            out = workroot / f"{name}-dump"
-            shutil.rmtree(out, ignore_errors=True)
+            if args.storage_run:
+                out = f"{args.storage_run}/{name}-dump"
+                s3_clear(out)
+            else:
+                out = workroot / f"{name}-dump"
+                shutil.rmtree(out, ignore_errors=True)
+                if kind == "pgfanout":
+                    out.mkdir()
             if kind == "pgfanout":
-                out.mkdir()
                 dump_cmd, restore_cmd = pgfanout_cmds(arg, conn, jobs, out, empty_config)
             else:
                 dump_cmd, restore_cmd = pgdump_cmds(conn, jobs, out)
@@ -502,7 +667,7 @@ def run_benchmark(args, variants, conn, env, workroot: Path, empty_config: Path)
             if not args.no_stabilize:
                 settle(conn)
             dump_s = run(dump_cmd, env=env)
-            results[name]["dump_bytes"] = dir_bytes(out)
+            results[name]["dump_bytes"] = s3_bytes(out) if args.storage_run else dir_bytes(out)
             if not args.no_stabilize:
                 settle(conn)
             restore_s = run(restore_cmd, env=env)
@@ -511,7 +676,19 @@ def run_benchmark(args, variants, conn, env, workroot: Path, empty_config: Path)
             if rnd >= 0:
                 results[name]["dump_s"].append(round(dump_s, 3))
                 results[name]["restore_s"].append(round(restore_s, 3))
-            shutil.rmtree(out, ignore_errors=True)
+            if args.storage_run:
+                # The timings are already recorded, so a failed delete here must not
+                # throw them away. It is retried before this path is used again and
+                # for the whole prefix at the end, where a failure is reported.
+                try:
+                    s3_clear(out)
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"warning: could not delete {out} after the run, will retry: {exc}",
+                        file=sys.stderr,
+                    )
+            else:
+                shutil.rmtree(out, ignore_errors=True)
             label = f"round {rnd + 1}/{args.repeats}" if rnd >= 0 else "warm-up"
             print(
                 f"{label:>11} {name:>14}: dump {dump_s:6.1f}s  restore {restore_s:6.1f}s",
