@@ -317,8 +317,16 @@ def pgdump_cmds(conn: dict[str, str], jobs: int, out: Path):
     return dump, restore
 
 
-def parse_variant(spec: str) -> tuple[str, str, str]:
+def parse_variant(spec: str) -> tuple[str, str, str, int | None]:
     name, _, rest = spec.partition("=")
+    # An optional trailing @N pins the variant to N jobs in a --jobs-sweep run.
+    pinned = None
+    m = re.search(r"@(\d+)$", rest)
+    if m:
+        pinned = int(m.group(1))
+        rest = rest[: m.start()]
+        if pinned < 1:
+            sys.exit(f"bad --variant {spec!r}: @JOBS must be at least 1")
     kind, _, arg = rest.partition(":")
     # The name becomes a directory under the work dir that is deleted
     # recursively, so it must not be able to point anywhere else.
@@ -326,7 +334,7 @@ def parse_variant(spec: str) -> tuple[str, str, str]:
         sys.exit(f"bad variant name {name!r}: use letters, digits, '_', '-' and '.' only")
     if kind not in ("pgfanout", "pgdump") or (kind == "pgfanout" and not arg):
         sys.exit(f"bad --variant {spec!r}; use NAME=pgfanout:BINDIR or NAME=pgdump")
-    return name, kind, arg
+    return name, kind, arg, pinned
 
 
 def main() -> None:
@@ -341,6 +349,14 @@ def main() -> None:
         help="unrecorded rounds first, so cold caches do not skew the first variant",
     )
     ap.add_argument("--jobs", type=int, default=4, help="parallel parts / jobs for every tool")
+    ap.add_argument(
+        "--jobs-sweep",
+        default=None,
+        metavar="N,N,...",
+        help="run every variant at each of these job counts (e.g. 1,2,4,8,16) in one "
+        "interleaved run, to see how each tool scales; results are keyed NAME@JOBS "
+        "and --jobs is ignored. Summarize with sweep_report.py",
+    )
     ap.add_argument(
         "--no-stabilize",
         action="store_true",
@@ -360,13 +376,24 @@ def main() -> None:
         ap.error("--repeats must be at least 1")
     if args.warmup < 0:
         ap.error("--warmup must not be negative")
-    if args.jobs < 1:
+    if args.jobs_sweep is None and args.jobs < 1:
         ap.error("--jobs must be at least 1")
+    if args.jobs_sweep is not None:
+        try:
+            args.sweep = [int(x) for x in args.jobs_sweep.split(",")]
+        except ValueError:
+            ap.error("--jobs-sweep takes comma-separated integers, e.g. 1,2,4,8")
+        if not args.sweep or min(args.sweep) < 1 or len(set(args.sweep)) != len(args.sweep):
+            ap.error("--jobs-sweep needs distinct job counts of at least 1")
+    else:
+        args.sweep = None
     if args.size_mb < 1:
         ap.error("--size-mb must be at least 1")
     variants = [parse_variant(v) for v in args.variant]
-    if len({n for n, _, _ in variants}) != len(variants):
+    if len({v[0] for v in variants}) != len(variants):
         ap.error("variant names must be unique")
+    if args.sweep is None and any(v[3] for v in variants):
+        ap.error("NAME=...@JOBS pins a variant's job count and needs --jobs-sweep")
     conn = env_conn()
     env = {**os.environ, "PGPASSWORD": conn["password"]}
 
@@ -412,7 +439,8 @@ def main() -> None:
         "warmup": args.warmup,
         "stabilized": not args.no_stabilize,
         "fsync_off": fsync_off,
-        "jobs": args.jobs,
+        "jobs": max(args.sweep) if args.sweep else args.jobs,
+        "jobs_sweep": args.sweep,
         "cpus": os.cpu_count(),
         "cpu_info": cpu_info(),
         "platform": platform.platform(),
@@ -442,21 +470,31 @@ def run_benchmark(args, variants, conn, env, workroot: Path, empty_config: Path)
         flush=True,
     )
 
+    # One entry per (variant, job count); without a sweep that is just the
+    # variants. A variant pinned with @JOBS runs once, at that job count, and
+    # keeps its plain name (a reference point beside the sweep).
+    combos = []
+    for j in args.sweep or [args.jobs]:
+        for n, k, a, pinned in variants:
+            if pinned is None:
+                combos.append((f"{n}@{j}" if args.sweep else n, k, a, j))
+    combos += [(n, k, a, pinned) for n, k, a, pinned in variants if pinned]
     results: dict[str, dict] = {
-        n: {"dump_s": [], "restore_s": [], "dump_bytes": None} for n, _, _ in variants
+        key: {"dump_s": [], "restore_s": [], "dump_bytes": None, "jobs": jobs}
+        for key, _, _, jobs in combos
     }
     for rnd in range(-args.warmup, args.repeats):
         # Rotate the order each round so no variant always runs first (warm cache).
-        shift = rnd % len(variants)
-        order = variants[shift:] + variants[:shift]
-        for name, kind, arg in order:
+        shift = rnd % len(combos)
+        order = combos[shift:] + combos[:shift]
+        for name, kind, arg, jobs in order:
             out = workroot / f"{name}-dump"
             shutil.rmtree(out, ignore_errors=True)
             if kind == "pgfanout":
                 out.mkdir()
-                dump_cmd, restore_cmd = pgfanout_cmds(arg, conn, args.jobs, out, empty_config)
+                dump_cmd, restore_cmd = pgfanout_cmds(arg, conn, jobs, out, empty_config)
             else:
-                dump_cmd, restore_cmd = pgdump_cmds(conn, args.jobs, out)
+                dump_cmd, restore_cmd = pgdump_cmds(conn, jobs, out)
 
             psql(conn, "postgres", f"DROP DATABASE IF EXISTS {DST_DB}")
             psql(conn, "postgres", f"CREATE DATABASE {DST_DB}")
@@ -476,7 +514,7 @@ def run_benchmark(args, variants, conn, env, workroot: Path, empty_config: Path)
             shutil.rmtree(out, ignore_errors=True)
             label = f"round {rnd + 1}/{args.repeats}" if rnd >= 0 else "warm-up"
             print(
-                f"{label:>11} {name:>10}: dump {dump_s:6.1f}s  restore {restore_s:6.1f}s",
+                f"{label:>11} {name:>14}: dump {dump_s:6.1f}s  restore {restore_s:6.1f}s",
                 flush=True,
             )
     return data, results

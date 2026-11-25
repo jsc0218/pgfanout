@@ -11,6 +11,8 @@ performance regressions in pull requests.
   equally.
 - [`compare.py`](compare.py) turns the JSON into a Markdown table and a
   verdict.
+- [`sweep_report.py`](sweep_report.py) summarizes a `--jobs-sweep` run: time,
+  speedup and parallel efficiency at each job count.
 
 ## Run it
 
@@ -40,6 +42,30 @@ comparison is like for like). Give `pgfanout:` once per build to compare two
 builds, for example an installed release and your working tree, and pass
 them to `compare.py` as `--base` and `--pr`. Run `python3 bench/bench.py
 --help` for all options (`--size-mb`, `--repeats`, `--warmup`, `--jobs`).
+
+## Scaling sweep
+
+To see how each tool scales with the job count, run every variant at several
+job counts in one interleaved run and summarize it:
+
+```bash
+python3 bench/bench.py \
+    --variant pgfanout=pgfanout:.venv/bin --variant pg_dump=pgdump@1 \
+    --size-mb 20000 --repeats 3 --jobs-sweep 1,2,4,8,16 --out sweep.json
+python3 bench/sweep_report.py sweep.json
+```
+
+Results are keyed `NAME@JOBS`, and `--jobs` is ignored. A trailing `@N` on a
+variant pins it to `N` jobs, so it runs once as a reference row instead of at
+every count: `--variant pg_dump=pgdump@1` times `pg_dump` once with one job,
+which is the useful baseline because `pg_dump -j` cannot split a single table. Efficiency is the
+speedup divided by the growth in job count, so about 100% means it still
+scales and a fall-off shows where the CPU, the server or the disk becomes the
+limit. Use a dataset large enough that the fixed startup cost (about 0.1-0.7s)
+is small next to the transfer, or nothing will appear to scale. The number of
+runs is variants x job counts x (repeats + warm-up), so keep `--repeats` low on
+a big dataset. On a machine where the server and the workers share CPUs, pin
+them to separate cores (`taskset`) or the curve will flatten early.
 
 ## What the numbers mean
 
