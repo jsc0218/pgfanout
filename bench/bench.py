@@ -677,7 +677,16 @@ def run_benchmark(args, variants, conn, env, workroot: Path, empty_config: Path)
                 results[name]["dump_s"].append(round(dump_s, 3))
                 results[name]["restore_s"].append(round(restore_s, 3))
             if args.storage_run:
-                s3_clear(out)
+                # The timings are already recorded, so a failed delete here must not
+                # throw them away. It is retried before this path is used again and
+                # for the whole prefix at the end, where a failure is reported.
+                try:
+                    s3_clear(out)
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"warning: could not delete {out} after the run, will retry: {exc}",
+                        file=sys.stderr,
+                    )
             else:
                 shutil.rmtree(out, ignore_errors=True)
             label = f"round {rnd + 1}/{args.repeats}" if rnd >= 0 else "warm-up"
