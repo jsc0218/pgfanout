@@ -36,6 +36,13 @@ upload buffers can chunk them. A `while True: chunk = read(); write(chunk)`
 loop pumps the data, with per-chunk `bytes_callback` updates. This is also
 the path used by tests that hand in `io.BytesIO`.
 
+For S3 the writer also overlaps reading and uploading: full parts are sent on
+background threads (`PGFANOUT_S3_UPLOAD_THREADS`, see the README), so the
+reader can keep draining `psql` while a part is on the wire. At most that many
+parts are in flight, which bounds RAM at part size x (threads + 1) per file.
+A failed upload is raised on a later write or at close, and the multipart
+upload is aborted once the parts still in flight have finished.
+
 ## Common to both paths
 
 The subprocess stays registered in the cancel registry, a dedicated thread

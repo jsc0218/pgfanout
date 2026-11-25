@@ -1021,3 +1021,188 @@ def test_localize_s3_blob_missing_temp_unlink_is_safe():
         os.unlink(p)
         assert not os.path.exists(p)
     # No exception raised on context exit.
+
+
+# ---------------------------------------------------------------------------
+# Background part uploads (upload_threads > 0)
+# ---------------------------------------------------------------------------
+
+
+class _FakeS3:
+    """Thread-safe in-memory S3 client that records what happened, and when."""
+
+    def __init__(self, *, delay=0.0, fail_part=None, gate=None):
+        import threading
+
+        self.lock = threading.Lock()
+        self.delay = delay
+        self.fail_part = fail_part
+        self.gate = gate  # an Event every upload_part waits for, if given
+        self.parts: dict[int, bytes] = {}
+        self.events: list[str] = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.upload_threads: set[str] = set()
+        self.completed = None
+        self.objects: dict[str, bytes] = {}
+
+    def create_multipart_upload(self, **kw):
+        return {"UploadId": "UP"}
+
+    def upload_part(self, *, Body, PartNumber, **kw):
+        import threading
+        import time
+
+        with self.lock:
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            self.upload_threads.add(threading.current_thread().name)
+        try:
+            if self.gate is not None:
+                assert self.gate.wait(10), "gate never opened"
+            if self.delay:
+                # later parts finish first, so ordering bugs would show up
+                time.sleep(self.delay / PartNumber)
+            if PartNumber == self.fail_part:
+                raise RuntimeError(f"boom on part {PartNumber}")
+            with self.lock:
+                self.parts[PartNumber] = bytes(Body)
+                self.events.append(f"part{PartNumber}")
+            return {"ETag": f"e{PartNumber}"}
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+
+    def complete_multipart_upload(self, *, MultipartUpload, **kw):
+        with self.lock:
+            self.events.append("complete")
+            self.completed = MultipartUpload["Parts"]
+        return {}
+
+    def abort_multipart_upload(self, **kw):
+        with self.lock:
+            self.events.append("abort")
+        return {}
+
+    def put_object(self, *, Key, Body, **kw):
+        self.objects[Key] = bytes(Body)
+        return {}
+
+
+def _write_all(client, data: bytes, *, threads, chunk=7):
+    blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=threads)
+    with blob.open_write() as sink:
+        for i in range(0, len(data), chunk):
+            sink.write(data[i : i + chunk])
+
+
+@pytest.mark.parametrize("threads", [0, 1, 2, 4])
+def test_s3_background_upload_keeps_part_order(tiny_part_size, threads):
+    """Whatever finishes first, the parts are reassembled in order."""
+    client = _FakeS3(delay=0.02)
+    data = bytes(range(256)) * 2  # 512 bytes -> 32 parts of 16 bytes
+    _write_all(client, data, threads=threads)
+    numbers = [p["PartNumber"] for p in client.completed]
+    assert numbers == list(range(1, 33))
+    assert b"".join(client.parts[n] for n in numbers) == data
+    assert [p["ETag"] for p in client.completed] == [f"e{n}" for n in numbers]
+
+
+def test_s3_zero_threads_uploads_in_the_calling_thread(tiny_part_size):
+    import threading
+
+    client = _FakeS3()
+    _write_all(client, b"x" * 40, threads=0)
+    assert client.upload_threads == {threading.current_thread().name}
+
+
+def test_s3_threads_upload_off_the_calling_thread(tiny_part_size):
+    import threading
+
+    client = _FakeS3()
+    _write_all(client, b"x" * 40, threads=2)
+    assert threading.current_thread().name not in client.upload_threads
+    assert all(n.startswith("pgfanout-s3-upload") for n in client.upload_threads)
+
+
+def test_s3_writer_keeps_reading_while_a_part_is_uploading(tiny_part_size):
+    """write() must return while an upload is still in flight (the whole point)."""
+    import threading
+
+    gate = threading.Event()
+    client = _FakeS3(gate=gate)
+    blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=1)
+    writer = blob.open_write()
+    sink = writer.__enter__()
+    done = threading.Event()
+
+    def feed():
+        sink.write(b"a" * 16)  # a full part -> upload starts and blocks on the gate
+        sink.write(b"b" * 10)  # must not wait for that upload
+        done.set()
+
+    t = threading.Thread(target=feed)
+    t.start()
+    try:
+        assert done.wait(5), "write() blocked on the in-flight upload"
+        assert client.parts == {}  # the first part is still uploading
+    finally:
+        gate.set()
+        t.join(5)
+        writer.__exit__(None, None, None)
+    assert b"".join(client.parts[n] for n in sorted(client.parts)) == b"a" * 16 + b"b" * 10
+
+
+@pytest.mark.parametrize("threads", [1, 2, 3])
+def test_s3_in_flight_parts_are_bounded(tiny_part_size, threads):
+    client = _FakeS3(delay=0.01)
+    _write_all(client, b"z" * 400, threads=threads)
+    assert 1 <= client.max_in_flight <= threads
+
+
+def test_s3_failed_background_upload_aborts_after_in_flight_parts_finish(tiny_part_size):
+    client = _FakeS3(delay=0.01, fail_part=2)
+    with pytest.raises(RuntimeError, match="boom on part 2"):
+        _write_all(client, b"q" * 200, threads=2)
+    assert client.completed is None
+    assert "complete" not in client.events
+    # abort runs once, and only after no upload is still running
+    assert client.events.count("abort") == 1
+    assert client.in_flight == 0
+    assert client.events[-1] == "abort"
+
+
+def test_s3_exception_in_with_block_stops_uploads_then_aborts(tiny_part_size):
+    client = _FakeS3(delay=0.01)
+    blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=2)
+    with pytest.raises(ValueError, match="stop"):
+        with blob.open_write() as sink:
+            sink.write(b"x" * 100)
+            raise ValueError("stop")
+    assert client.events.count("abort") == 1
+    assert client.events[-1] == "abort"
+    assert client.completed is None
+
+
+def test_s3_empty_object_with_threads_still_uses_put_object(tiny_part_size):
+    client = _FakeS3()
+    _write_all(client, b"", threads=2)
+    assert client.objects == {"k": b""}
+    assert client.completed is None
+
+
+def test_s3_upload_threads_env(monkeypatch):
+    from pgfanout import storage
+
+    monkeypatch.delenv(storage.S3_UPLOAD_THREADS_ENV, raising=False)
+    assert S3Blob("b", "k", client=object())._upload_threads == storage.S3_DEFAULT_UPLOAD_THREADS
+    monkeypatch.setenv(storage.S3_UPLOAD_THREADS_ENV, "0")
+    assert S3Blob("b", "k", client=object())._upload_threads == 0
+    monkeypatch.setenv(storage.S3_UPLOAD_THREADS_ENV, "4")
+    assert S3Blob("b", "k", client=object())._upload_threads == 4
+    # an explicit argument wins over the environment
+    assert S3Blob("b", "k", client=object(), upload_threads=2)._upload_threads == 2
+    for bad in ("x", "-1", str(storage.S3_MAX_UPLOAD_THREADS + 1)):
+        monkeypatch.setenv(storage.S3_UPLOAD_THREADS_ENV, bad)
+        with pytest.raises(ValueError, match=storage.S3_UPLOAD_THREADS_ENV):
+            S3Blob("b", "k", client=object())

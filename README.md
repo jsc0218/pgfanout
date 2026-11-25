@@ -239,11 +239,19 @@ and out of `ps` output.
 | `AWS_SESSION_TOKEN`              | If using STS / assumed-role credentials                         |
 | `AWS_REGION`                     | Defaults to `us-east-1` when unset (most Ceph/MinIO accept it)  |
 | `AWS_S3_VERIFY_SSL`              | `false` to disable TLS verify, or a path to a CA bundle         |
+| `PGFANOUT_S3_UPLOAD_THREADS`     | Background upload threads per part file, 0-8 (see below)        |
 
 Credentials are also read from `~/.aws/credentials` if not set
 explicitly — boto3's default chain applies.
 
-The multipart upload parts are 16 MiB (5 MiB is the S3 minimum). A failed
+The multipart upload parts are 16 MiB (5 MiB is the S3 minimum). Parts are
+uploaded on background threads, so reading the next part from `psql` overlaps
+with sending the previous one; without that, each part blocks the reader and
+a single worker is limited to a fraction of what S3 can take.
+`PGFANOUT_S3_UPLOAD_THREADS` sets how many parts per file can be on the wire
+at once (`0` uploads in the writing thread and gives the old, serial
+behaviour). Memory per part file is 16 MiB x (threads + 1), so with `--num-parts`
+workers it is about `num_parts` times that. A failed
 upload is aborted on a best-effort basis: if the abort call itself fails (the
 endpoint is down, or `s3:AbortMultipartUpload` is not allowed), the uploaded
 parts stay and keep accruing storage charges, so add a bucket lifecycle rule
