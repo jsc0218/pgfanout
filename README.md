@@ -239,7 +239,7 @@ and out of `ps` output.
 | `AWS_SESSION_TOKEN`              | If using STS / assumed-role credentials                         |
 | `AWS_REGION`                     | Defaults to `us-east-1` when unset (most Ceph/MinIO accept it)  |
 | `AWS_S3_VERIFY_SSL`              | `false` to disable TLS verify, or a path to a CA bundle         |
-| `PGFANOUT_S3_UPLOAD_THREADS`     | Background upload threads per part file, 0-8 (see below)        |
+| `PGFANOUT_S3_UPLOAD_THREADS`     | Background upload threads per part file, 0-8, default 2 (below) |
 
 Credentials are also read from `~/.aws/credentials` if not set
 explicitly — boto3's default chain applies.

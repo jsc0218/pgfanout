@@ -323,6 +323,16 @@ def _stub_multipart_upload(stub, bucket, key, parts: list[bytes], upload_id="UP1
     )
 
 
+@pytest.fixture(autouse=True)
+def _serial_s3_uploads(monkeypatch):
+    """The Stubber-based tests queue responses in a fixed order, so upload in the
+    calling thread there. The background-upload tests below pass upload_threads
+    explicitly, and test_s3_upload_threads_env sets the variable itself."""
+    from pgfanout import storage
+
+    monkeypatch.setenv(storage.S3_UPLOAD_THREADS_ENV, "0")
+
+
 @pytest.fixture
 def tiny_part_size(monkeypatch):
     """Lower the S3 minimum part size so streaming tests can use 16 B parts.

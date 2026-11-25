@@ -118,7 +118,7 @@ S3_DEFAULT_PART_SIZE = 16 * 1024 * 1024
 # number of such threads per part file; 0 uploads in the writing thread (each
 # part blocks the reader until S3 has it). It is also the number of parts that
 # can be in flight, so RAM per part file is part_size * (threads + 1).
-S3_DEFAULT_UPLOAD_THREADS = 1
+S3_DEFAULT_UPLOAD_THREADS = 2
 S3_MAX_UPLOAD_THREADS = 8  # stays inside botocore's default pool of 10 connections
 S3_UPLOAD_THREADS_ENV = "PGFANOUT_S3_UPLOAD_THREADS"
 
