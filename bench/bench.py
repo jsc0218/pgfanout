@@ -142,6 +142,52 @@ def dir_bytes(path: Path) -> int:
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
 
+def s3_split(uri: str) -> tuple[str, str]:
+    """('s3://bucket/some/prefix') -> ('bucket', 'some/prefix/')."""
+    bucket, _, prefix = uri[len("s3://") :].partition("/")
+    return bucket, (prefix.rstrip("/") + "/") if prefix else ""
+
+
+def s3_client():
+    # boto3 is only needed for --storage, so import it lazily. The endpoint
+    # and region follow the same variables pgfanout reads (see its README).
+    try:
+        import boto3
+    except ImportError:
+        sys.exit("--storage needs boto3: run bench.py with the Python of a pgfanout install")
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ.get("AWS_ENDPOINT_URL_S3")
+        or os.environ.get("AWS_S3_ENDPOINT_URL")
+        or None,
+        region_name=os.environ.get("AWS_REGION") or "us-east-1",
+    )
+
+
+def s3_bytes(uri: str) -> int:
+    bucket, prefix = s3_split(uri)
+    total = 0
+    pages = s3_client().get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
+    for page in pages:
+        total += sum(o["Size"] for o in page.get("Contents", []))
+    return total
+
+
+def s3_clear(uri: str) -> None:
+    """Delete every object under *uri*, and abort any unfinished multipart upload."""
+    bucket, prefix = s3_split(uri)
+    client = s3_client()
+    pages = client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
+    for page in pages:
+        keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+        if keys:
+            client.delete_objects(Bucket=bucket, Delete={"Objects": keys, "Quiet": True})
+    pages = client.get_paginator("list_multipart_uploads").paginate(Bucket=bucket, Prefix=prefix)
+    for page in pages:
+        for up in page.get("Uploads", []):
+            client.abort_multipart_upload(Bucket=bucket, Key=up["Key"], UploadId=up["UploadId"])
+
+
 def generate_dataset(conn: dict[str, str], size_mb: int) -> dict:
     """(Re)create the source database with a fixed, deterministic dataset."""
     psql(conn, "postgres", f"DROP DATABASE IF EXISTS {SRC_DB}")
@@ -271,7 +317,7 @@ def verify(conn: dict[str, str], expected: dict[str, int], variant: str) -> None
             sys.exit(f"{variant}: {table} has {got} rows after restore, expected {want}")
 
 
-def pgfanout_cmds(bindir: str, conn: dict[str, str], jobs: int, out: Path, config: Path):
+def pgfanout_cmds(bindir: str, conn: dict[str, str], jobs: int, out: Path | str, config: Path):
     # An explicit (empty) config file stops pgfanout from picking up a
     # ./pgfanout.toml or ~/.config/pgfanout/pgfanout.toml, which could change
     # the table, the unlogged mode or the part count being measured.
@@ -368,6 +414,15 @@ def main() -> None:
         help="leave fsync on (realistic disk behaviour, noisier). By default fsync is "
         "turned off, for a server on this machine only",
     )
+    ap.add_argument(
+        "--storage",
+        default=None,
+        metavar="s3://BUCKET/PREFIX",
+        help="write the dump to S3 (or an S3-compatible store) instead of local disk and "
+        "restore from it. Only pgfanout variants can do this. Each run uses its own "
+        "unique prefix under PREFIX and deletes it afterwards. Credentials, endpoint "
+        "and region come from the usual AWS_* environment variables",
+    )
     ap.add_argument("--workdir", default=None, help="where dumps are written (default: temp dir)")
     ap.add_argument("--out", default="bench-results.json")
     args = ap.parse_args()
@@ -394,6 +449,15 @@ def main() -> None:
         ap.error("variant names must be unique")
     if args.sweep is None and any(v[3] for v in variants):
         ap.error("NAME=...@JOBS pins a variant's job count and needs --jobs-sweep")
+    if args.storage is not None:
+        if not re.fullmatch(r"s3://[^/\s]+(/\S*)?", args.storage):
+            ap.error("--storage must look like s3://BUCKET/PREFIX")
+        if any(v[1] == "pgdump" for v in variants):
+            ap.error("--storage only works with pgfanout variants; pg_dump cannot write to S3")
+        # A prefix of our own, so a leftover or concurrent run is never touched.
+        args.storage_run = f"{args.storage.rstrip('/')}/bench-{int(time.time())}-{os.getpid()}"
+    else:
+        args.storage_run = None
     conn = env_conn()
     env = {**os.environ, "PGPASSWORD": conn["password"]}
 
@@ -421,6 +485,8 @@ def main() -> None:
             ("drop databases", lambda: drop_databases(conn)),
             ("restore server settings", lambda: restore_server(conn, originals, touched)),
         ]
+        if args.storage_run:
+            cleanup.append(("delete the S3 test objects", lambda: s3_clear(args.storage_run)))
         if "fsync" in touched:
             cleanup.append(
                 ("flush data written with fsync off", lambda: flush_after_fsync_off(conn))
@@ -441,6 +507,7 @@ def main() -> None:
         "fsync_off": fsync_off,
         "jobs": max(args.sweep) if args.sweep else args.jobs,
         "jobs_sweep": args.sweep,
+        "storage": "s3" if args.storage else "local",
         "cpus": os.cpu_count(),
         "cpu_info": cpu_info(),
         "platform": platform.platform(),
@@ -488,10 +555,15 @@ def run_benchmark(args, variants, conn, env, workroot: Path, empty_config: Path)
         shift = rnd % len(combos)
         order = combos[shift:] + combos[:shift]
         for name, kind, arg, jobs in order:
-            out = workroot / f"{name}-dump"
-            shutil.rmtree(out, ignore_errors=True)
+            if args.storage_run:
+                out = f"{args.storage_run}/{name}-dump"
+                s3_clear(out)
+            else:
+                out = workroot / f"{name}-dump"
+                shutil.rmtree(out, ignore_errors=True)
+                if kind == "pgfanout":
+                    out.mkdir()
             if kind == "pgfanout":
-                out.mkdir()
                 dump_cmd, restore_cmd = pgfanout_cmds(arg, conn, jobs, out, empty_config)
             else:
                 dump_cmd, restore_cmd = pgdump_cmds(conn, jobs, out)
@@ -502,7 +574,7 @@ def run_benchmark(args, variants, conn, env, workroot: Path, empty_config: Path)
             if not args.no_stabilize:
                 settle(conn)
             dump_s = run(dump_cmd, env=env)
-            results[name]["dump_bytes"] = dir_bytes(out)
+            results[name]["dump_bytes"] = s3_bytes(out) if args.storage_run else dir_bytes(out)
             if not args.no_stabilize:
                 settle(conn)
             restore_s = run(restore_cmd, env=env)
@@ -511,7 +583,10 @@ def run_benchmark(args, variants, conn, env, workroot: Path, empty_config: Path)
             if rnd >= 0:
                 results[name]["dump_s"].append(round(dump_s, 3))
                 results[name]["restore_s"].append(round(restore_s, 3))
-            shutil.rmtree(out, ignore_errors=True)
+            if args.storage_run:
+                s3_clear(out)
+            else:
+                shutil.rmtree(out, ignore_errors=True)
             label = f"round {rnd + 1}/{args.repeats}" if rnd >= 0 else "warm-up"
             print(
                 f"{label:>11} {name:>14}: dump {dump_s:6.1f}s  restore {restore_s:6.1f}s",

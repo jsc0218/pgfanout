@@ -67,6 +67,36 @@ runs is variants x job counts x (repeats + warm-up), so keep `--repeats` low on
 a big dataset. On a machine where the server and the workers share CPUs, pin
 them to separate cores (`taskset`) or the curve will flatten early.
 
+## Benchmarking S3
+
+`--storage s3://BUCKET/PREFIX` sends the dump to S3 (or an S3-compatible
+store) and restores from it, instead of using local disk:
+
+```bash
+export AWS_REGION=us-east-1   # credentials: instance role or AWS_* variables
+python3 bench/bench.py --variant pgfanout=pgfanout:.venv/bin \
+    --storage s3://my-bucket/pgfanout-bench \
+    --size-mb 20000 --repeats 3 --jobs-sweep 1,2,4,8,16 --out s3-sweep.json
+python3 bench/sweep_report.py s3-sweep.json
+```
+
+- Run `bench.py` with the Python of a pgfanout install, because it needs
+  `boto3`. The endpoint, region and credentials come from the same `AWS_*`
+  variables pgfanout reads (see the README's S3 section).
+- Only pgfanout variants work: `pg_dump` cannot write to S3.
+- Every run writes under its own `PREFIX/bench-<time>-<pid>/` and deletes it
+  afterwards, including unfinished multipart uploads, so it never touches
+  other objects. If a run is killed, delete that prefix by hand.
+- Run it from an instance in the bucket's region, reaching S3 through a VPC
+  gateway endpoint. Through a NAT gateway you pay per GB, and a large sweep
+  moves hundreds of GB.
+- Find the instance's raw S3 ceiling first (a plain parallel `aws s3 cp`),
+  as you would check a disk with `fio`, so you know what pgfanout is being
+  held against. The restore still writes the database and its WAL to the
+  server's disk, so its ceiling is often that disk, not S3.
+- S3 timings vary more than a local disk. Use at least 3 repeats and read the
+  min-max column.
+
 ## What the numbers mean
 
 By default the harness tunes the server for repeatability: it raises
