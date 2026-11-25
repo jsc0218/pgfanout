@@ -179,11 +179,14 @@ def s3_preflight(base_uri: str) -> None:
     In a versioned bucket a plain delete only adds a delete marker and keeps
     the dump data, so the cleanup this harness promises would not hold.
     """
+    # Build the client first: it gives the readable "needs boto3" error if boto3
+    # is missing, before botocore is imported below.
+    client = s3_client()
     from botocore.exceptions import ClientError
 
     bucket, _ = s3_split(base_uri)
     try:
-        status = s3_client().get_bucket_versioning(Bucket=bucket).get("Status")
+        status = client.get_bucket_versioning(Bucket=bucket).get("Status")
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         if code in ("NoSuchBucket", "404"):
@@ -208,10 +211,10 @@ def s3_bytes(uri: str) -> int:
 
 def s3_clear(uri: str) -> None:
     """Delete every object under *uri*, and abort any unfinished multipart upload."""
+    client = s3_client()  # first, for the readable error if boto3 is missing
     from botocore.exceptions import ClientError
 
     bucket, prefix = s3_split(uri)
-    client = s3_client()
     # A delete can succeed overall yet fail for single keys, so keep going and
     # report everything that was left behind at the end.
     errors: list[str] = []
