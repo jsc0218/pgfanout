@@ -8,6 +8,9 @@ returns canned responses).
 
 import io
 import os
+import signal
+import threading
+import time
 
 import boto3
 import pytest
@@ -321,6 +324,16 @@ def _stub_multipart_upload(stub, bucket, key, parts: list[bytes], upload_id="UP1
             },
         },
     )
+
+
+@pytest.fixture(autouse=True)
+def _serial_s3_uploads(monkeypatch):
+    """The Stubber-based tests queue responses in a fixed order, so upload in the
+    calling thread there. The background-upload tests below pass upload_threads
+    explicitly, and test_s3_upload_threads_env sets the variable itself."""
+    from pgfanout import storage
+
+    monkeypatch.setenv(storage.S3_UPLOAD_THREADS_ENV, "0")
 
 
 @pytest.fixture
@@ -1021,3 +1034,377 @@ def test_localize_s3_blob_missing_temp_unlink_is_safe():
         os.unlink(p)
         assert not os.path.exists(p)
     # No exception raised on context exit.
+
+
+# ---------------------------------------------------------------------------
+# Background part uploads (upload_threads > 0)
+# ---------------------------------------------------------------------------
+
+
+class _FakeS3:
+    """Thread-safe in-memory S3 client that records what happened, and when."""
+
+    def __init__(self, *, delay=0.0, fail_part=None, gate=None):
+        import threading
+
+        self.lock = threading.Lock()
+        self.delay = delay
+        self.fail_part = fail_part
+        self.gate = gate  # an Event every upload_part waits for, if given
+        self.parts: dict[int, bytes] = {}
+        self.events: list[str] = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.in_flight_at_abort: list[int] = []
+        self.upload_threads: set[str] = set()
+        self.completed = None
+        self.objects: dict[str, bytes] = {}
+
+    def create_multipart_upload(self, **kw):
+        return {"UploadId": "UP"}
+
+    def upload_part(self, *, Body, PartNumber, **kw):
+        import threading
+        import time
+
+        with self.lock:
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            self.upload_threads.add(threading.current_thread().name)
+        try:
+            if self.gate is not None:
+                assert self.gate.wait(10), "gate never opened"
+            if self.delay:
+                # later parts finish first, so ordering bugs would show up
+                time.sleep(self.delay / PartNumber)
+            if PartNumber == self.fail_part:
+                raise RuntimeError(f"boom on part {PartNumber}")
+            with self.lock:
+                self.parts[PartNumber] = bytes(Body)
+                self.events.append(f"part{PartNumber}")
+            return {"ETag": f"e{PartNumber}"}
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+
+    def complete_multipart_upload(self, *, MultipartUpload, **kw):
+        with self.lock:
+            self.events.append("complete")
+            self.completed = MultipartUpload["Parts"]
+        return {}
+
+    def abort_multipart_upload(self, **kw):
+        with self.lock:
+            self.events.append("abort")
+            self.in_flight_at_abort.append(self.in_flight)
+        return {}
+
+    def put_object(self, *, Key, Body, **kw):
+        self.objects[Key] = bytes(Body)
+        return {}
+
+
+def _write_all(client, data: bytes, *, threads, chunk=7):
+    blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=threads)
+    with blob.open_write() as sink:
+        for i in range(0, len(data), chunk):
+            sink.write(data[i : i + chunk])
+
+
+@pytest.mark.parametrize("threads", [0, 1, 2, 4])
+def test_s3_background_upload_keeps_part_order(tiny_part_size, threads):
+    """Whatever finishes first, the parts are reassembled in order."""
+    client = _FakeS3(delay=0.02)
+    data = bytes(range(256)) * 2  # 512 bytes -> 32 parts of 16 bytes
+    _write_all(client, data, threads=threads)
+    numbers = [p["PartNumber"] for p in client.completed]
+    assert numbers == list(range(1, 33))
+    assert b"".join(client.parts[n] for n in numbers) == data
+    assert [p["ETag"] for p in client.completed] == [f"e{n}" for n in numbers]
+
+
+def test_s3_zero_threads_uploads_in_the_calling_thread(tiny_part_size):
+    import threading
+
+    client = _FakeS3()
+    _write_all(client, b"x" * 40, threads=0)
+    assert client.upload_threads == {threading.current_thread().name}
+
+
+def test_s3_threads_upload_off_the_calling_thread(tiny_part_size):
+    import threading
+
+    client = _FakeS3()
+    _write_all(client, b"x" * 40, threads=2)
+    assert threading.current_thread().name not in client.upload_threads
+    assert all(n.startswith("pgfanout-s3-upload") for n in client.upload_threads)
+
+
+def test_s3_writer_keeps_reading_while_a_part_is_uploading(tiny_part_size):
+    """write() must return while an upload is still in flight (the whole point)."""
+    import threading
+
+    gate = threading.Event()
+    client = _FakeS3(gate=gate)
+    blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=1)
+    writer = blob.open_write()
+    sink = writer.__enter__()
+    done = threading.Event()
+
+    def feed():
+        sink.write(b"a" * 16)  # a full part -> upload starts and blocks on the gate
+        sink.write(b"b" * 10)  # must not wait for that upload
+        done.set()
+
+    t = threading.Thread(target=feed)
+    t.start()
+    try:
+        assert done.wait(5), "write() blocked on the in-flight upload"
+        assert client.parts == {}  # the first part is still uploading
+    finally:
+        gate.set()
+        t.join(5)
+        writer.__exit__(None, None, None)
+    assert b"".join(client.parts[n] for n in sorted(client.parts)) == b"a" * 16 + b"b" * 10
+
+
+@pytest.mark.parametrize("threads", [1, 2, 3])
+def test_s3_in_flight_parts_are_bounded(tiny_part_size, threads):
+    client = _FakeS3(delay=0.01)
+    _write_all(client, b"z" * 400, threads=threads)
+    assert 1 <= client.max_in_flight <= threads
+
+
+def test_s3_failed_background_upload_aborts_after_in_flight_parts_finish(tiny_part_size):
+    client = _FakeS3(delay=0.01, fail_part=2)
+    with pytest.raises(RuntimeError, match="boom on part 2"):
+        _write_all(client, b"q" * 200, threads=2)
+    assert client.completed is None
+    assert "complete" not in client.events
+    # abort runs once, and only after no upload is still running
+    assert client.events.count("abort") == 1
+    assert client.in_flight == 0
+    assert client.events[-1] == "abort"
+
+
+def test_s3_exception_in_with_block_stops_uploads_then_aborts(tiny_part_size):
+    client = _FakeS3(delay=0.01)
+    blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=2)
+    with pytest.raises(ValueError, match="stop"):
+        with blob.open_write() as sink:
+            sink.write(b"x" * 100)
+            raise ValueError("stop")
+    assert client.events.count("abort") == 1
+    assert client.events[-1] == "abort"
+    assert client.completed is None
+
+
+def test_s3_empty_object_with_threads_still_uses_put_object(tiny_part_size):
+    client = _FakeS3()
+    _write_all(client, b"", threads=2)
+    assert client.objects == {"k": b""}
+    assert client.completed is None
+
+
+def test_s3_upload_threads_env(monkeypatch):
+    from pgfanout import storage
+
+    monkeypatch.delenv(storage.S3_UPLOAD_THREADS_ENV, raising=False)
+    assert S3Blob("b", "k", client=object())._upload_threads == storage.S3_DEFAULT_UPLOAD_THREADS
+    monkeypatch.setenv(storage.S3_UPLOAD_THREADS_ENV, "0")
+    assert S3Blob("b", "k", client=object())._upload_threads == 0
+    monkeypatch.setenv(storage.S3_UPLOAD_THREADS_ENV, "4")
+    assert S3Blob("b", "k", client=object())._upload_threads == 4
+    # an explicit argument wins over the environment
+    assert S3Blob("b", "k", client=object(), upload_threads=2)._upload_threads == 2
+    for bad in ("x", "-1", str(storage.S3_MAX_UPLOAD_THREADS + 1)):
+        monkeypatch.setenv(storage.S3_UPLOAD_THREADS_ENV, bad)
+        with pytest.raises(ValueError, match=storage.S3_UPLOAD_THREADS_ENV):
+            S3Blob("b", "k", client=object())
+
+
+def test_s3_memory_is_bounded_when_all_upload_slots_are_busy(monkeypatch):
+    """With every slot busy the writer must block *before* copying another part.
+
+    The documented bound is part_size * (threads + 1); an extra slice and copy
+    taken before the wait used to push the peak to about five parts.
+    """
+    import threading
+    import tracemalloc
+
+    from pgfanout import storage
+
+    monkeypatch.setattr(storage, "S3_MIN_PART_SIZE", 1)
+    part, threads, chunk = 1 << 20, 2, 64 << 10
+    gate = threading.Event()  # closed: uploads never finish, so the slots stay full
+    client = _FakeS3(gate=gate)
+    blob = S3Blob("b", "k", client=client, part_size=part, upload_threads=threads)
+    writer = blob.open_write()
+    sink = writer.__enter__()
+    finished = threading.Event()
+
+    def feed():
+        for _ in range(8 * (part // chunk)):  # 8 parts' worth, so it must block
+            sink.write(b"\0" * chunk)
+        finished.set()
+
+    tracemalloc.start()
+    t = threading.Thread(target=feed)
+    t.start()
+    try:
+        assert not finished.wait(1.5), "the writer should be blocked on full upload slots"
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+        gate.set()
+        t.join(10)
+        writer.__exit__(None, None, None)
+    assert peak <= (threads + 1.5) * part, f"peak {peak / part:.1f} parts, expected <= 3.5"
+
+
+def test_s3_one_huge_write_does_not_buffer_the_whole_write(monkeypatch):
+    """A single write much larger than a part is cut into parts as it goes."""
+    import threading
+    import tracemalloc
+
+    from pgfanout import storage
+
+    monkeypatch.setattr(storage, "S3_MIN_PART_SIZE", 1)
+    part = 1 << 20
+    gate = threading.Event()
+    client = _FakeS3(gate=gate)
+    blob = S3Blob("b", "k", client=client, part_size=part, upload_threads=1)
+    writer = blob.open_write()
+    sink = writer.__enter__()
+    big = bytes(16 * part)
+    tracemalloc.start()
+    t = threading.Thread(target=lambda: sink.write(big))
+    t.start()
+    try:
+        t.join(1.5)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+        gate.set()
+        t.join(10)
+        writer.__exit__(None, None, None)
+    # one part filling + one in flight, never the 16 parts of the write
+    assert peak <= 3.5 * part, f"peak {peak / part:.1f} parts"
+
+
+_MAIN_THREAD_ID = threading.get_ident()
+
+
+def _sigint_main_thread():
+    """Deliver a real SIGINT to the main thread, so a blocked wait there is interrupted.
+
+    ``_thread.interrupt_main`` only sets a flag and does not wake a thread that is
+    blocked waiting, so it would fire after the wait rather than during it.
+    """
+    signal.pthread_kill(_MAIN_THREAD_ID, signal.SIGINT)
+
+
+def test_s3_interrupt_while_stopping_uploads_still_aborts_and_keeps_the_error(tiny_part_size):
+    """A Ctrl-C during the wait must not skip the abort or hide the original error.
+
+    The interrupt is delivered to the main thread while ``shutdown(wait=True)``
+    is genuinely blocked on uploads that are held by a gate, so the wait itself
+    is what gets interrupted, and the abort must still come after every part
+    has finished.
+    """
+    import threading
+
+    gate = threading.Event()
+    client = _FakeS3(gate=gate)
+    blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=2)
+    timers = [
+        threading.Timer(0.3, _sigint_main_thread),  # lands inside the wait
+        threading.Timer(0.8, gate.set),  # uploads finish after the interrupt
+    ]
+    try:
+        with pytest.raises(ValueError, match="original failure"):
+            with blob.open_write() as sink:
+                sink.write(b"x" * 40)  # parts are in flight, held by the gate
+                deadline = time.monotonic() + 5
+                while client.in_flight < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert client.in_flight == 2
+                for t in timers:
+                    t.start()
+                raise ValueError("original failure")
+    finally:
+        for t in timers:
+            t.cancel()
+        gate.set()
+    assert client.in_flight_at_abort == [0]  # nothing was on the wire at abort
+    assert client.events.count("abort") == 1
+    assert client.events[-1] == "abort"
+    assert client.completed is None
+
+
+def test_s3_interrupt_while_stopping_uploads_is_reraised_without_an_original_error(tiny_part_size):
+    """With nothing else failing, the interrupt itself reaches the caller, after the abort."""
+    import threading
+
+    gate = threading.Event()
+    client = _FakeS3(gate=gate)
+    blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=2)
+    timers = [
+        threading.Timer(0.3, _sigint_main_thread),
+        threading.Timer(0.8, gate.set),
+    ]
+    sink = blob.open_write().__enter__()
+    try:
+        sink.write(b"x" * 40)
+        deadline = time.monotonic() + 5
+        while client.in_flight < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        for t in timers:
+            t.start()
+        with pytest.raises(KeyboardInterrupt):
+            sink._stop_uploads()
+    finally:
+        for t in timers:
+            t.cancel()
+        gate.set()
+    assert client.in_flight == 0  # the wait ran to the end before re-raising
+
+
+def test_s3_interrupt_before_the_wait_starts_still_aborts_after_uploads_finish(tiny_part_size):
+    """An interrupt in the first, non-blocking step of stopping must not skip the wait.
+
+    The step that cancels queued parts runs before any blocking wait, and an
+    interrupt there used to escape with the pool and the pending parts already
+    forgotten, so the abort ran while uploads were still on the wire.
+    """
+    gate = threading.Event()
+    client = _FakeS3(gate=gate)
+    blob = S3Blob("b", "k", client=client, part_size=16, upload_threads=2)
+    interrupted = []
+    timer = threading.Timer(0.5, gate.set)  # uploads finish well after the interrupt
+    try:
+        with pytest.raises(ValueError, match="original failure"):
+            with blob.open_write() as sink:
+                sink.write(b"x" * 40)
+                deadline = time.monotonic() + 5
+                while client.in_flight < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert client.in_flight == 2
+                real_shutdown = sink._pool.shutdown
+
+                def shutdown(*a, **kw):
+                    if not interrupted:
+                        interrupted.append(True)
+                        timer.start()
+                        raise KeyboardInterrupt  # lands in the non-blocking step
+                    return real_shutdown(*a, **kw)
+
+                sink._pool.shutdown = shutdown
+                raise ValueError("original failure")
+    finally:
+        timer.cancel()
+        gate.set()
+    assert interrupted
+    assert client.in_flight_at_abort == [0]
+    assert client.events[-1] == "abort"
+    assert client.completed is None

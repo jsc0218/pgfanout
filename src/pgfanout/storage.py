@@ -23,6 +23,9 @@ from __future__ import annotations
 import os
 import tempfile
 from abc import ABC, abstractmethod
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, BinaryIO
 from urllib.parse import urlparse
@@ -111,6 +114,15 @@ class LocalBlob(Blob):
 S3_MIN_PART_SIZE = 5 * 1024 * 1024
 S3_DEFAULT_PART_SIZE = 16 * 1024 * 1024
 
+# Parts are uploaded on background threads so the writer can keep reading the
+# next part from ``psql`` while the previous one is on the wire. This is the
+# number of such threads per part file; 0 uploads in the writing thread (each
+# part blocks the reader until S3 has it). It is also the number of parts that
+# can be in flight, so RAM per part file is part_size * (threads + 1).
+S3_DEFAULT_UPLOAD_THREADS = 2
+S3_MAX_UPLOAD_THREADS = 8  # stays inside botocore's default pool of 10 connections
+S3_UPLOAD_THREADS_ENV = "PGFANOUT_S3_UPLOAD_THREADS"
+
 
 def is_s3_uri(uri: str) -> bool:
     """True if *uri* targets an S3 (or S3-compatible) endpoint.
@@ -159,6 +171,19 @@ def _parse_s3_prefix(uri: str) -> tuple[str, str]:
     if prefix and not prefix.endswith("/"):
         prefix += "/"
     return bucket, prefix
+
+
+def _upload_threads_from_env() -> int:
+    raw = (os.environ.get(S3_UPLOAD_THREADS_ENV) or "").strip()
+    if not raw:
+        return S3_DEFAULT_UPLOAD_THREADS
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{S3_UPLOAD_THREADS_ENV} must be an integer, got {raw!r}") from None
+    if not 0 <= value <= S3_MAX_UPLOAD_THREADS:
+        raise ValueError(f"{S3_UPLOAD_THREADS_ENV} must be 0-{S3_MAX_UPLOAD_THREADS}, got {value}")
+    return value
 
 
 def _env_bool(name: str, default: bool | None = None) -> bool | None:
@@ -251,11 +276,25 @@ class _S3MultipartWriter:
     * Chunks smaller than the part size accumulate; the part is flushed
       only once the buffer has enough data.  The final buffer (whatever
       remains at close) is uploaded as the last part regardless of size.
+    * With ``upload_threads > 0`` full parts are uploaded on background
+      threads, so the caller keeps reading the next part while the previous
+      one is on the wire. At most ``upload_threads`` parts are in flight; a
+      further flush waits for the oldest, which bounds RAM at
+      ``part_size * (upload_threads + 1)``. A failed upload surfaces on a
+      later ``write`` or at close, and the multipart upload is then aborted
+      once the uploads still in flight have finished (aborting earlier could
+      let a late part land after the abort). ``upload_threads=0`` uploads in
+      the calling thread.
     """
 
-    def __init__(self, client, bucket: str, key: str, part_size: int):
+    def __init__(self, client, bucket: str, key: str, part_size: int, upload_threads: int = 0):
         if part_size < S3_MIN_PART_SIZE:
             raise ValueError(f"part_size must be >= {S3_MIN_PART_SIZE} (S3 minimum)")
+        if upload_threads < 0:
+            raise ValueError("upload_threads must not be negative")
+        self._upload_threads = upload_threads
+        self._pool: ThreadPoolExecutor | None = None
+        self._pending: deque[Future] = deque()  # in-flight parts, oldest first
         self._client = client
         self._bucket = bucket
         self._key = key
@@ -269,6 +308,10 @@ class _S3MultipartWriter:
     def __enter__(self) -> _S3MultipartWriter:
         resp = self._client.create_multipart_upload(Bucket=self._bucket, Key=self._key)
         self._upload_id = resp["UploadId"]
+        if self._upload_threads:
+            self._pool = ThreadPoolExecutor(
+                max_workers=self._upload_threads, thread_name_prefix="pgfanout-s3-upload"
+            )
         return self
 
     def write(self, data: bytes) -> int:
@@ -276,26 +319,106 @@ class _S3MultipartWriter:
             raise ValueError("write() after close")
         if not data:
             return 0
-        self._buf.extend(data)
-        # Flush full parts while buffer has enough bytes; keep the tail
-        # in the buffer so it can grow past part_size before the next
-        # upload_part call.
-        while len(self._buf) >= self._part_size:
-            self._flush_part(self._part_size)
+        # Feed the buffer one part at a time instead of appending all of *data*
+        # first, so a large write cannot grow it past part_size. Part boundaries
+        # are the same as before; a short tail stays in the buffer until the
+        # next write or close.
+        with memoryview(data) as view:
+            pos = 0
+            while pos < len(view):
+                take = min(self._part_size - len(self._buf), len(view) - pos)
+                self._buf.extend(view[pos : pos + take])
+                pos += take
+                if len(self._buf) >= self._part_size:
+                    self._flush_part(self._part_size)
         return len(data)
 
-    def _flush_part(self, size: int) -> None:
-        body = bytes(self._buf[:size])
-        del self._buf[:size]
+    def _upload_part(self, part_number: int, body: bytes) -> dict:
         resp = self._client.upload_part(
             Bucket=self._bucket,
             Key=self._key,
-            PartNumber=self._next_part_num,
+            PartNumber=part_number,
             UploadId=self._upload_id,
             Body=body,
         )
-        self._parts.append({"PartNumber": self._next_part_num, "ETag": resp["ETag"]})
+        return {"PartNumber": part_number, "ETag": resp["ETag"]}
+
+    def _reap_oldest(self) -> None:
+        """Wait for the oldest in-flight part; re-raises its upload error."""
+        self._parts.append(self._pending.popleft().result())
+
+    def _flush_part(self, size: int) -> None:
+        if self._pool is not None:
+            # Make room *before* copying the part: collect finished uploads so a
+            # failure shows up early, then wait for the oldest if every slot is
+            # busy. Copying first would hold one more part than the documented
+            # bound (part_size * (threads + 1)) while blocked.
+            while self._pending and self._pending[0].done():
+                self._reap_oldest()
+            while len(self._pending) >= self._upload_threads:
+                self._reap_oldest()
+        # One copy of the part (the views are released before the buffer shrinks).
+        with memoryview(self._buf) as view, view[:size] as part:
+            body = bytes(part)
+        del self._buf[:size]
+        part_number = self._next_part_num
         self._next_part_num += 1
+        if self._pool is None:
+            self._parts.append(self._upload_part(part_number, body))
+        else:
+            self._pending.append(self._pool.submit(self._upload_part, part_number, body))
+
+    def _drain(self) -> None:
+        """Wait for every in-flight part (in order), raising the first failure."""
+        while self._pending:
+            self._reap_oldest()
+
+    def _stop_uploads(self) -> None:
+        """Let uploads already on the wire finish, and run no further ones.
+
+        An interrupt (Ctrl-C) while waiting does not cut the wait short: the
+        wait is finished and the interrupt is re-raised afterwards. That keeps
+        the caller's abort from racing a part that is still being sent.
+        """
+        pool = self._pool
+        pending = list(self._pending)
+        interrupt: BaseException | None = None
+        if pool is not None:
+            # Every step is inside the loop, so an interrupt at any point is kept
+            # and the step is simply run again; only then is the state cleared.
+            #
+            # Wait on the futures, not on Thread.join: on Python 3.10 a join that
+            # is interrupted by Ctrl-C marks the thread finished while it is still
+            # running, so a retried shutdown() would return early.
+            while True:
+                try:
+                    for future in pending:
+                        future.cancel()  # parts that have not started; a running one refuses
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    # A cancelled future never runs, and on 3.10 its waiters are never
+                    # woken, so only the uploads that are actually running are waited on.
+                    wait_futures([f for f in pending if not f.cancelled()])
+                    pool.shutdown(wait=True)  # nothing left to wait for, only the threads exit
+                    break
+                except BaseException as exc:  # noqa: BLE001
+                    interrupt = interrupt or exc
+        self._pool = None
+        self._pending.clear()
+        if interrupt is not None:
+            raise interrupt
+
+    def _abort_once_uploads_finish(self) -> None:
+        """Failure cleanup: wait for in-flight parts, then abort the upload.
+
+        Never raises (apart from the abort call itself), so the failure being
+        handled is the one the caller sees, and the abort always runs, and runs
+        only after no part is still on the wire.
+        """
+        try:
+            self._stop_uploads()
+        except BaseException:  # noqa: BLE001, S110 - superseded by the failure in progress
+            pass
+        self._best_effort_abort()
 
     def _best_effort_abort(self) -> None:
         """Tear down the multipart upload so dangling parts don't accrue charges.
@@ -325,8 +448,10 @@ class _S3MultipartWriter:
         if exc_type is not None:
             # Propagate the original exception, but first try to free
             # the dangling parts on the server so the caller isn't
-            # charged storage for an aborted upload.
-            self._best_effort_abort()
+            # charged storage for an aborted upload. Uploads already on the
+            # wire finish first: a part that lands after the abort would
+            # otherwise be left behind.
+            self._abort_once_uploads_finish()
             return False  # let the exception propagate
 
         # Happy-path finalisation.  Any failure here (trailing flush,
@@ -352,6 +477,7 @@ class _S3MultipartWriter:
             # S3 allows the last part to be arbitrary size).
             if self._buf:
                 self._flush_part(len(self._buf))
+            self._drain()  # every in-flight part, in order; raises a failed upload
 
             if not self._parts:
                 # S3 rejects CompleteMultipartUpload with zero parts, so
@@ -370,8 +496,10 @@ class _S3MultipartWriter:
                 MultipartUpload={"Parts": self._parts},
             )
         except BaseException:
-            self._best_effort_abort()
+            self._abort_once_uploads_finish()
             raise
+        finally:
+            self._stop_uploads()  # releases the upload threads; a no-op if done
         return False
 
 
@@ -406,7 +534,8 @@ class S3Blob(Blob):
     """Backend for ``s3://bucket/key`` URIs.
 
     Writes use a streaming multipart upload so arbitrarily large blobs
-    cost ``part_size`` bytes of RAM at a time — never the whole object.
+    cost ``part_size * (upload_threads + 1)`` bytes of RAM at a time —
+    never the whole object.
     Reads wrap ``GetObject``'s streaming body.
 
     The client is constructed once via :func:`make_s3_client` (or passed
@@ -422,10 +551,15 @@ class S3Blob(Blob):
         *,
         client=None,
         part_size: int = S3_DEFAULT_PART_SIZE,
+        upload_threads: int | None = None,
     ):
         self._bucket = bucket
         self._key = key
         self._part_size = part_size
+        # None means: PGFANOUT_S3_UPLOAD_THREADS, else the default.
+        self._upload_threads = (
+            _upload_threads_from_env() if upload_threads is None else upload_threads
+        )
         self._client = client  # lazily created if None
 
     @classmethod
@@ -439,7 +573,9 @@ class S3Blob(Blob):
         return self._client
 
     def open_write(self) -> BinaryIO:
-        return _S3MultipartWriter(self._get_client(), self._bucket, self._key, self._part_size)  # type: ignore[return-value]
+        return _S3MultipartWriter(  # type: ignore[return-value]
+            self._get_client(), self._bucket, self._key, self._part_size, self._upload_threads
+        )
 
     def open_read(self) -> BinaryIO:
         """Return a chunked streaming reader (a boto3 ``StreamingBody``).
