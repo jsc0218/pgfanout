@@ -126,15 +126,11 @@ S3_DEFAULT_UPLOAD_THREADS = 2
 S3_MAX_UPLOAD_THREADS = 8  # stays inside botocore's default pool of 10 connections
 S3_UPLOAD_THREADS_ENV = "PGFANOUT_S3_UPLOAD_THREADS"
 
-# Integrity check on every uploaded part. "crc32" (the default): pgfanout
-# computes a CRC32 of the part with zlib (C code) and sends it as a plain
-# header, and S3 rejects the part if the bytes it received do not match.
-# "boto3": leave it to boto3, whose default sends the part through a
-# Python-level aws-chunked wrapper with a trailing checksum, which made dumps
-# with 8 or more workers take 35-43% longer in our measurements. Use "boto3"
-# for a store that does not accept a CRC32 on a multipart upload.
-S3_PART_CHECKSUM_ENV = "PGFANOUT_S3_PART_CHECKSUM"
-S3_PART_CHECKSUMS = ("crc32", "boto3")
+# Every uploaded part carries a CRC32 that pgfanout computes with zlib (C code)
+# and sends as a plain header, so S3 can refuse a part whose bytes were damaged
+# on the way. boto3's own default does that through a Python-level aws-chunked
+# wrapper with a trailing checksum, which made dumps with 8 or more workers take
+# 35-43% longer in our measurements.
 
 
 def is_s3_uri(uri: str) -> bool:
@@ -197,18 +193,6 @@ def _upload_threads_from_env() -> int:
     if not 0 <= value <= S3_MAX_UPLOAD_THREADS:
         raise ValueError(f"{S3_UPLOAD_THREADS_ENV} must be 0-{S3_MAX_UPLOAD_THREADS}, got {value}")
     return value
-
-
-def _part_checksum_from_env() -> bool:
-    """True when pgfanout should send its own CRC32 with every part."""
-    raw = (os.environ.get(S3_PART_CHECKSUM_ENV) or "").strip().lower()
-    if not raw:
-        return True
-    if raw not in S3_PART_CHECKSUMS:
-        raise ValueError(
-            f"{S3_PART_CHECKSUM_ENV} must be one of {', '.join(S3_PART_CHECKSUMS)}, got {raw!r}"
-        )
-    return raw == "crc32"
 
 
 def _crc32_b64(data) -> str:
@@ -315,9 +299,8 @@ class _S3MultipartWriter:
       once the uploads still in flight have finished (aborting earlier could
       let a late part land after the abort). ``upload_threads=0`` uploads in
       the calling thread.
-    * With ``checksum`` every part carries a CRC32 computed here (see
-      ``PGFANOUT_S3_PART_CHECKSUM``), and the upload is created with the same
-      algorithm so S3 accepts and verifies it.
+    * Every part carries a CRC32 computed here, and the upload is created with
+      the same algorithm, so S3 verifies each part.
     """
 
     def __init__(
@@ -327,14 +310,12 @@ class _S3MultipartWriter:
         key: str,
         part_size: int,
         upload_threads: int = 0,
-        checksum: bool = False,
     ):
         if part_size < S3_MIN_PART_SIZE:
             raise ValueError(f"part_size must be >= {S3_MIN_PART_SIZE} (S3 minimum)")
         if upload_threads < 0:
             raise ValueError("upload_threads must not be negative")
         self._upload_threads = upload_threads
-        self._checksum = checksum  # send our own CRC32 with each part
         self._pool: ThreadPoolExecutor | None = None
         self._pending: deque[Future] = deque()  # in-flight parts, oldest first
         self._client = client
@@ -348,8 +329,9 @@ class _S3MultipartWriter:
         self._closed = False
 
     def __enter__(self) -> _S3MultipartWriter:
-        extra = {"ChecksumAlgorithm": "CRC32"} if self._checksum else {}
-        resp = self._client.create_multipart_upload(Bucket=self._bucket, Key=self._key, **extra)
+        resp = self._client.create_multipart_upload(
+            Bucket=self._bucket, Key=self._key, ChecksumAlgorithm="CRC32"
+        )
         self._upload_id = resp["UploadId"]
         if self._upload_threads:
             self._pool = ThreadPoolExecutor(
@@ -377,17 +359,17 @@ class _S3MultipartWriter:
         return len(data)
 
     def _upload_part(self, part_number: int, body: bytes) -> dict:
-        extra = {"ChecksumCRC32": _crc32_b64(body)} if self._checksum else {}
+        checksum = _crc32_b64(body)
         resp = self._client.upload_part(
             Bucket=self._bucket,
             Key=self._key,
             PartNumber=part_number,
             UploadId=self._upload_id,
             Body=body,
-            **extra,
+            ChecksumCRC32=checksum,
         )
         # CompleteMultipartUpload must repeat each part's checksum.
-        return {"PartNumber": part_number, "ETag": resp["ETag"], **extra}
+        return {"PartNumber": part_number, "ETag": resp["ETag"], "ChecksumCRC32": checksum}
 
     def _reap_oldest(self) -> None:
         """Wait for the oldest in-flight part; re-raises its upload error."""
@@ -598,7 +580,6 @@ class S3Blob(Blob):
         client=None,
         part_size: int = S3_DEFAULT_PART_SIZE,
         upload_threads: int | None = None,
-        part_checksum: bool | None = None,
     ):
         self._bucket = bucket
         self._key = key
@@ -607,8 +588,6 @@ class S3Blob(Blob):
         self._upload_threads = (
             _upload_threads_from_env() if upload_threads is None else upload_threads
         )
-        # None means: PGFANOUT_S3_PART_CHECKSUM, else our own CRC32.
-        self._part_checksum = _part_checksum_from_env() if part_checksum is None else part_checksum
         self._client = client  # lazily created if None
 
     @classmethod
@@ -628,7 +607,6 @@ class S3Blob(Blob):
             self._key,
             self._part_size,
             self._upload_threads,
-            self._part_checksum,
         )
 
     def open_read(self) -> BinaryIO:
