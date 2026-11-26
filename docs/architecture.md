@@ -45,7 +45,7 @@ upload is aborted once the parts still in flight have finished.
 
 Each part also carries a CRC32 that pgfanout computes with `zlib` and sends as
 a header (the upload is created with `ChecksumAlgorithm=CRC32`, and each part's
-checksum is repeated in `CompleteMultipartUpload`), so S3 verifies every part.
+checksum is repeated in `CompleteMultipartUpload`), so a store that verifies it checks every part.
 boto3's default instead streams each part through a Python wrapper with a
 trailing checksum, which costs far more CPU under the GIL.
 

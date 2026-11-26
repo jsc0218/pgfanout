@@ -298,7 +298,7 @@ class _S3MultipartWriter:
       let a late part land after the abort). ``upload_threads=0`` uploads in
       the calling thread.
     * Every part carries a CRC32 computed here, and the upload is created with
-      the same algorithm, so S3 verifies each part.
+      the same algorithm, so a store that verifies it checks each part.
     """
 
     def __init__(self, client, bucket: str, key: str, part_size: int, upload_threads: int = 0):
