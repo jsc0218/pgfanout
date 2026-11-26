@@ -126,12 +126,6 @@ S3_DEFAULT_UPLOAD_THREADS = 2
 S3_MAX_UPLOAD_THREADS = 8  # stays inside botocore's default pool of 10 connections
 S3_UPLOAD_THREADS_ENV = "PGFANOUT_S3_UPLOAD_THREADS"
 
-# Every uploaded part carries a CRC32 that pgfanout computes with zlib (C code)
-# and sends as a plain header, so S3 can refuse a part whose bytes were damaged
-# on the way. boto3's own default does that through a Python-level aws-chunked
-# wrapper with a trailing checksum, which made dumps with 8 or more workers take
-# 35-43% longer in our measurements.
-
 
 def is_s3_uri(uri: str) -> bool:
     """True if *uri* targets an S3 (or S3-compatible) endpoint.
@@ -196,7 +190,11 @@ def _upload_threads_from_env() -> int:
 
 
 def _crc32_b64(data) -> str:
-    """CRC32 of *data* in the form S3 expects (big-endian, base64)."""
+    """CRC32 of *data* in the form S3 expects (big-endian, base64).
+
+    Computed here, and sent as a plain header, because boto3's default does the
+    same job through a Python-level ``aws-chunked`` wrapper that is much slower.
+    """
     return base64.b64encode(struct.pack(">I", zlib.crc32(data))).decode("ascii")
 
 
@@ -303,14 +301,7 @@ class _S3MultipartWriter:
       the same algorithm, so S3 verifies each part.
     """
 
-    def __init__(
-        self,
-        client,
-        bucket: str,
-        key: str,
-        part_size: int,
-        upload_threads: int = 0,
-    ):
+    def __init__(self, client, bucket: str, key: str, part_size: int, upload_threads: int = 0):
         if part_size < S3_MIN_PART_SIZE:
             raise ValueError(f"part_size must be >= {S3_MIN_PART_SIZE} (S3 minimum)")
         if upload_threads < 0:
@@ -602,11 +593,7 @@ class S3Blob(Blob):
 
     def open_write(self) -> BinaryIO:
         return _S3MultipartWriter(  # type: ignore[return-value]
-            self._get_client(),
-            self._bucket,
-            self._key,
-            self._part_size,
-            self._upload_threads,
+            self._get_client(), self._bucket, self._key, self._part_size, self._upload_threads
         )
 
     def open_read(self) -> BinaryIO:

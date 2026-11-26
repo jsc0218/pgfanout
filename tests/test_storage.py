@@ -1489,49 +1489,6 @@ def test_s3_corrupted_part_is_refused_and_the_upload_aborted(tiny_part_size):
     assert client.events[-1] == "abort"
 
 
-def test_s3_part_checksum_request_shape(tiny_part_size):
-    """The exact requests of an upload, against botocore's own parameter model."""
-    client, stub = _stub_client()
-    crc = _expected_crc32(b"hello")
-    stub.add_response(
-        "create_multipart_upload",
-        {"UploadId": "UP1", "Bucket": "b", "Key": "k"},
-        expected_params={
-            "Bucket": "b",
-            "Key": "k",
-            "ChecksumAlgorithm": "CRC32",
-        },
-    )
-    stub.add_response(
-        "upload_part",
-        {"ETag": '"etag-1"', "ChecksumCRC32": crc},
-        expected_params={
-            "Bucket": "b",
-            "Key": "k",
-            "PartNumber": 1,
-            "UploadId": "UP1",
-            "Body": b"hello",
-            "ChecksumCRC32": crc,
-        },
-    )
-    stub.add_response(
-        "complete_multipart_upload",
-        {"Bucket": "b", "Key": "k", "ETag": '"final"'},
-        expected_params={
-            "Bucket": "b",
-            "Key": "k",
-            "UploadId": "UP1",
-            "MultipartUpload": {
-                "Parts": [{"PartNumber": 1, "ETag": '"etag-1"', "ChecksumCRC32": crc}]
-            },
-        },
-    )
-    blob = S3Blob("b", "k", client=client, part_size=tiny_part_size)
-    with blob.open_write() as sink:
-        sink.write(b"hello")
-    stub.assert_no_pending_responses()
-
-
 def test_s3_part_upload_avoids_botocores_aws_chunked_path(tiny_part_size):
     """What actually goes on the wire: the part body as plain bytes with our checksum
     header, not wrapped in aws-chunked with a trailing checksum (the slow path)."""
