@@ -240,6 +240,7 @@ and out of `ps` output.
 | `AWS_REGION`                     | Defaults to `us-east-1` when unset (most Ceph/MinIO accept it)  |
 | `AWS_S3_VERIFY_SSL`              | `false` to disable TLS verify, or a path to a CA bundle         |
 | `PGFANOUT_S3_UPLOAD_THREADS`     | Background upload threads per part file, 0-8, default 2 (below) |
+| `PGFANOUT_S3_PART_CHECKSUM`      | `crc32` (default) or `boto3`: who checksums each part (below)   |
 
 Credentials are also read from `~/.aws/credentials` if not set
 explicitly — boto3's default chain applies.
@@ -256,6 +257,15 @@ upload is aborted on a best-effort basis: if the abort call itself fails (the
 endpoint is down, or `s3:AbortMultipartUpload` is not allowed), the uploaded
 parts stay and keep accruing storage charges, so add a bucket lifecycle rule
 that aborts incomplete multipart uploads. See `src/pgfanout/storage.py`.
+
+Every uploaded part carries a CRC32, and S3 rejects a part whose bytes do not
+match it. By default pgfanout computes the CRC32 itself (with `zlib`, in C) and
+sends it as a plain header (`PGFANOUT_S3_PART_CHECKSUM=crc32`). boto3's own
+default does the same job by sending each part through a Python-level
+`aws-chunked` wrapper with a trailing checksum, which is much slower for 16 MiB
+parts. Set `PGFANOUT_S3_PART_CHECKSUM=boto3` to leave it to boto3 again, for an
+S3-compatible store that does not accept a CRC32 on a multipart upload (such a
+store makes the dump fail with its own error; only AWS S3 and moto have been tried).
 
 ## 📝 Config file
 
