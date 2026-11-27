@@ -102,6 +102,18 @@ python3 bench/sweep_report.py s3-sweep.json
 - S3 timings vary more than a local disk. Use at least 3 repeats and read the
   min-max column.
 
+## S3 in CI
+
+The Benchmark workflow also runs the dump and restore through S3: a local
+SeaweedFS (pinned release, HTTPS with a self-signed certificate, data on
+`/mnt`) stands in for S3, `bench.py --storage` runs the base and the PR against
+it, and `compare.py` applies the same rules as for the local run. HTTPS matters
+because boto3 only wraps each part in its trailing-checksum encoding over TLS.
+It catches breakage and large slowdowns in the S3 read and write paths, but a
+runner's 4 shared vCPUs hide a client-side cost: with the checksum fix of #19
+reverted, its dump moved only 1-3%. Use `--storage` on a dedicated machine for
+that.
+
 ## What the numbers mean
 
 By default the harness tunes the server for repeatability: it raises

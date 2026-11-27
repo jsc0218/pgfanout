@@ -44,6 +44,7 @@ def main() -> None:
     ap.add_argument("--threshold", type=float, default=0.05, help="allowed slowdown (0.05 = 5%%)")
     ap.add_argument("--min-abs", type=float, default=0.2, help="ignore slowdowns under N seconds")
     ap.add_argument("--fail", action="store_true", help="exit 1 on regression")
+    ap.add_argument("--title", default="pgfanout benchmark", help="heading of the report")
     args = ap.parse_args()
 
     data = json.load(open(args.results))
@@ -73,7 +74,7 @@ def main() -> None:
         )
 
     ref_hdr = f"vs {args.reference}" if args.reference else "vs reference"
-    print("### pgfanout benchmark\n")
+    print(f"### {args.title}\n")
     print(
         f"{size_mb:.0f} MB database, {meta['jobs']} jobs, median of {meta['repeats']} "
         f"interleaved runs, {cpu_text(meta)}, PostgreSQL {meta['server_version']}"
