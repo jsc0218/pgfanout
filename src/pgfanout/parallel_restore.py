@@ -315,6 +315,7 @@ def copy_part(
     part_index: int,
     results: dict[int, dict],
     size_hint: int = 0,
+    readers: int = 1,
 ) -> None:
     """Load one part blob into the table via ``COPY ... FROM STDIN``.
 
@@ -352,6 +353,9 @@ def copy_part(
     without the hint we'd issue N HEADs in parallel every time a set
     of parts is launched, just to print each part's size in the
     "Starting" log line.  Zero means "unknown, stat it here".
+
+    *readers* is how many parts are being loaded at the same time; an S3 source reads
+    further ahead the fewer there are (see :meth:`storage.Blob.open_stream`).
     """
     size = size_hint if size_hint else source.size()
     LOG.info("[part %d] %s (%.1f MB)", part_index, source.uri, size / 1e6)
@@ -374,7 +378,7 @@ def copy_part(
 
     start = time.time()
     try:
-        with source.open_read() as src:
+        with source.open_stream(readers) as src:
             stream_source_to_subprocess(
                 cmd,
                 src,
@@ -658,7 +662,7 @@ def restore_table_data(
     for i, (part_blob, part_size) in enumerate(zip(parts, part_sizes, strict=False), start=1):
         t = threading.Thread(
             target=copy_part,
-            args=(conn, qtable, part_blob, i, results, part_size),
+            args=(conn, qtable, part_blob, i, results, part_size, len(parts)),
         )
         threads.append(t)
 
@@ -724,7 +728,15 @@ def restore_table_data(
         for i in retry_indices:
             t = threading.Thread(
                 target=copy_part,
-                args=(conn, qtable, parts[i - 1], i, results, part_sizes[i - 1]),
+                args=(
+                    conn,
+                    qtable,
+                    parts[i - 1],
+                    i,
+                    results,
+                    part_sizes[i - 1],
+                    len(retry_indices),
+                ),
             )
             retry_threads.append(t)
         for t in retry_threads:

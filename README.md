@@ -240,6 +240,7 @@ and out of `ps` output.
 | `AWS_REGION`                     | Defaults to `us-east-1` when unset (most Ceph/MinIO accept it)  |
 | `AWS_S3_VERIFY_SSL`              | `false` to disable TLS verify, or a path to a CA bundle         |
 | `PGFANOUT_S3_UPLOAD_THREADS`     | Background upload threads per part file, 0-8, default 2 (below) |
+| `PGFANOUT_S3_READ_THREADS`       | Read-ahead GETs per part file on restore, 0-4; unset picks it by part count (below) |
 
 Credentials are also read from `~/.aws/credentials` if not set
 explicitly — boto3's default chain applies.
@@ -256,6 +257,17 @@ upload is aborted on a best-effort basis: if the abort call itself fails (the
 endpoint is down, or `s3:AbortMultipartUpload` is not allowed), the uploaded
 parts stay and keep accruing storage charges, so add a bucket lifecycle rule
 that aborts incomplete multipart uploads. See `src/pgfanout/storage.py`.
+
+A restore reads each part file back as one GET stream, which S3 serves at about
+100 MB/s, so reading N parts is capped near N x 100 MB/s however fast the server is
+(a default 4-part restore of a 12 GB table took 33s from S3 against 19s from local
+disk). Each part is therefore read ahead with a few ranged GETs of 16 MiB in
+flight, enough to keep about 8 streams going in all: 4 per part for 1-2 parts, 3
+for 3, 2 for 4-7, and a plain single stream from 8 parts up, where the single Python
+process is the limit and extra threads only slow it down. The same restore then took
+22s, and a 2-part one 34s instead of 66s. `PGFANOUT_S3_READ_THREADS` sets it explicitly (`0` is the plain stream).
+Memory per part file is 16 MiB x (threads + 1). Every range must come from the same
+version of the object (its ETag is checked), and a short read is an error.
 
 Every uploaded part carries a CRC32, which pgfanout computes itself (with
 `zlib`, in C) and sends as a plain header; a store that verifies it rejects a

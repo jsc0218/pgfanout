@@ -17,6 +17,7 @@ import pytest
 from botocore.exceptions import ClientError
 from botocore.stub import Stubber
 
+from pgfanout import storage
 from pgfanout.storage import (
     Blob,
     LocalBlob,
@@ -1656,3 +1657,177 @@ def test_s3_payload_signing_keeps_the_users_s3_settings(endpoint, no_endpoint_en
         endpoint_url=endpoint, aws_access_key_id="AKIATEST", aws_secret_access_key="secret"
     )
     assert client.meta.config.s3["addressing_style"] == "path"
+
+
+# ---------------------------------------------------------------------------
+# Read-ahead reader (a restore's S3 data path)
+# ---------------------------------------------------------------------------
+
+
+class _RangeBody:
+    def __init__(self, data):
+        self._data = data
+        self.closed = False
+
+    def read(self, n=None):
+        return self._data if n is None else self._data[:n]
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeObject:
+    """An S3 client holding one object, serving HeadObject and ranged GetObject."""
+
+    def __init__(self, data, *, delay=0.0, fail_at=None, short_at=None, other_etag_from=None):
+        import threading
+
+        self.data = data
+        self.delay = delay
+        self.fail_at = fail_at
+        self.short_at = short_at
+        self.other_etag_from = other_etag_from
+        self.lock = threading.Lock()
+        self.ranges: list[tuple[int, int]] = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.bodies: list[_RangeBody] = []
+
+    def head_object(self, **_):
+        return {"ContentLength": len(self.data), "ETag": '"v1"'}
+
+    def get_object(self, *, Range, **_):
+        start, end = (int(x) for x in Range.removeprefix("bytes=").split("-"))
+        with self.lock:
+            self.ranges.append((start, end))
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            time.sleep(self.delay)
+            if start == self.fail_at:
+                raise ClientError({"Error": {"Code": "InternalError", "Message": "x"}}, "GetObject")
+            chunk = self.data[start : end + 1]
+            if start == self.short_at:
+                chunk = chunk[:-1]
+            etag = (
+                '"v1"' if self.other_etag_from is None or start < self.other_etag_from else '"v2"'
+            )
+            body = _RangeBody(chunk)
+            with self.lock:
+                self.bodies.append(body)
+            return {"Body": body, "ETag": etag}
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+
+
+def _stream(client, *, threads=3, chunk=10, concurrency=1):
+    blob = S3Blob("b", "k", client=client, read_threads=threads, read_chunk_size=chunk)
+    return blob.open_stream(concurrency)
+
+
+@pytest.mark.parametrize("size", [0, 1, 9, 10, 11, 100, 107])
+@pytest.mark.parametrize("step", [None, 1, 7, 10, 33, 1000])
+def test_s3_read_ahead_returns_the_object_in_order(size, step):
+    data = (bytes(range(256)) * 2)[:size]
+    client = _FakeObject(data)
+    out = bytearray()
+    with _stream(client) as r:
+        if step is None:
+            out += r.read()
+        else:
+            while chunk := r.read(step):
+                out += chunk
+        assert r.read(5) == b""  # at the end it stays at the end
+    assert bytes(out) == data
+
+
+def test_s3_read_ahead_asks_for_every_byte_once_in_chunk_sized_ranges():
+    data = os.urandom(95)
+    client = _FakeObject(data)
+    with _stream(client, chunk=10) as r:
+        assert r.read() == data
+    assert sorted(client.ranges) == [(i, min(i + 9, 94)) for i in range(0, 95, 10)]
+    assert all(body.closed for body in client.bodies)
+
+
+def test_s3_read_ahead_keeps_several_requests_in_flight_but_no_more_than_threads():
+    client = _FakeObject(os.urandom(200), delay=0.05)
+    with _stream(client, threads=3, chunk=10) as r:
+        assert len(r.read()) == 200
+    assert 2 <= client.max_in_flight <= 3
+
+
+def test_s3_read_ahead_stops_fetching_once_closed():
+    client = _FakeObject(os.urandom(1000), delay=0.02)
+    with _stream(client, threads=2, chunk=10) as r:
+        assert len(r.read(15)) == 15
+    time.sleep(0.2)  # whatever was already on the wire has finished by now
+    asked = len(client.ranges)
+    time.sleep(0.2)
+    assert len(client.ranges) == asked < 100
+    with pytest.raises(ValueError, match="closed"):
+        r.read(1)
+
+
+def test_s3_read_ahead_raises_a_failed_range_where_it_is_read():
+    client = _FakeObject(os.urandom(100), fail_at=30)
+    with _stream(client, threads=2, chunk=10) as r:
+        assert len(r.read(30)) == 30  # the ranges before it are fine
+        with pytest.raises(ClientError, match="InternalError"):
+            r.read(10)
+
+
+def test_s3_read_ahead_notices_an_object_replaced_while_it_is_read():
+    client = _FakeObject(os.urandom(100), other_etag_from=50)
+    with _stream(client, threads=2, chunk=10) as r:
+        r.read(50)
+        with pytest.raises(OSError, match="changed while"):
+            r.read(10)
+
+
+def test_s3_read_ahead_treats_a_short_range_as_an_error():
+    client = _FakeObject(os.urandom(100), short_at=20)
+    with _stream(client, threads=2, chunk=10) as r:
+        r.read(20)
+        with pytest.raises(OSError, match="short read"):
+            r.read(10)
+
+
+@pytest.mark.parametrize(
+    ("parts", "threads"),
+    [(1, 4), (2, 4), (3, 3), (4, 2), (5, 2), (7, 2), (8, 1), (16, 1)],
+)
+def test_s3_read_ahead_threads_follow_the_number_of_parts(parts, threads, monkeypatch):
+    from pgfanout.storage import _S3ReadAheadReader, _S3StreamReader
+
+    monkeypatch.delenv(storage.S3_READ_THREADS_ENV, raising=False)
+    blob = S3Blob("b", "k", client=_FakeObject(b"x"))
+    reader = blob.open_stream(parts)
+    if threads == 1:
+        assert isinstance(reader, _S3StreamReader)  # a plain stream: no read-ahead
+    else:
+        assert isinstance(reader, _S3ReadAheadReader)
+        assert reader._threads == threads
+
+
+def test_s3_read_threads_env_overrides_the_part_count(monkeypatch):
+    from pgfanout.storage import _S3ReadAheadReader, _S3StreamReader
+
+    client = _FakeObject(b"x")
+    monkeypatch.setenv(storage.S3_READ_THREADS_ENV, "0")
+    assert isinstance(S3Blob("b", "k", client=client).open_stream(2), _S3StreamReader)
+    monkeypatch.setenv(storage.S3_READ_THREADS_ENV, "3")
+    reader = S3Blob("b", "k", client=client).open_stream(16)
+    assert isinstance(reader, _S3ReadAheadReader) and reader._threads == 3
+    for bad in ("x", "-1", str(storage.S3_MAX_READ_THREADS + 1)):
+        monkeypatch.setenv(storage.S3_READ_THREADS_ENV, bad)
+        with pytest.raises(ValueError, match=storage.S3_READ_THREADS_ENV):
+            S3Blob("b", "k", client=client)
+
+
+def test_open_stream_of_a_local_blob_is_a_plain_read(tmp_path):
+    path = tmp_path / "part1.bin"
+    path.write_bytes(b"abc" * 100)
+    with LocalBlob(str(path)).open_stream(4) as f:
+        assert f.read() == b"abc" * 100

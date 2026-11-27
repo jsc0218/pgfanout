@@ -52,6 +52,14 @@ class Blob(ABC):
     @abstractmethod
     def open_read(self) -> BinaryIO: ...
 
+    def open_stream(self, concurrency: int = 1) -> BinaryIO:
+        """Open for one sequential pass over the whole blob (a restore's data path).
+
+        Same bytes as :meth:`open_read`; a backend may read ahead to keep up.
+        *concurrency* is how many blobs the caller reads at the same time.
+        """
+        return self.open_read()
+
     @abstractmethod
     def size(self) -> int:
         """Return the size in bytes, or 0 if the blob does not exist."""
@@ -126,6 +134,17 @@ S3_DEFAULT_UPLOAD_THREADS = 2
 S3_MAX_UPLOAD_THREADS = 8  # stays inside botocore's default pool of 10 connections
 S3_UPLOAD_THREADS_ENV = "PGFANOUT_S3_UPLOAD_THREADS"
 
+# Reading a part back is one GET stream of about 100 MB/s, so a restore that reads N
+# parts moves about N x 100 MB/s from S3 whatever the server could take (a default
+# 4-part restore took 35s from S3 against 19s from local disk). The parts are therefore
+# read ahead with ranged GETs, enough of them to keep about S3_READ_STREAMS streams
+# going in all, and none from that many parts up: past a few hundred MB/s the single
+# Python process is the limit, and more threads only slow it down.
+S3_READ_STREAMS = 8
+S3_MAX_READ_THREADS = 4  # per part; stays inside botocore's default pool of 10 connections
+S3_READ_THREADS_ENV = "PGFANOUT_S3_READ_THREADS"
+S3_READ_CHUNK_SIZE = 16 << 20
+
 
 def is_s3_uri(uri: str) -> bool:
     """True if *uri* targets an S3 (or S3-compatible) endpoint.
@@ -176,17 +195,35 @@ def _parse_s3_prefix(uri: str) -> tuple[str, str]:
     return bucket, prefix
 
 
-def _upload_threads_from_env() -> int:
-    raw = (os.environ.get(S3_UPLOAD_THREADS_ENV) or "").strip()
+def _threads_from_env(name: str, default: int, maximum: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
     if not raw:
-        return S3_DEFAULT_UPLOAD_THREADS
+        return default
     try:
         value = int(raw)
     except ValueError:
-        raise ValueError(f"{S3_UPLOAD_THREADS_ENV} must be an integer, got {raw!r}") from None
-    if not 0 <= value <= S3_MAX_UPLOAD_THREADS:
-        raise ValueError(f"{S3_UPLOAD_THREADS_ENV} must be 0-{S3_MAX_UPLOAD_THREADS}, got {value}")
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+    if not 0 <= value <= maximum:
+        raise ValueError(f"{name} must be 0-{maximum}, got {value}")
     return value
+
+
+def _upload_threads_from_env() -> int:
+    return _threads_from_env(
+        S3_UPLOAD_THREADS_ENV, S3_DEFAULT_UPLOAD_THREADS, S3_MAX_UPLOAD_THREADS
+    )
+
+
+def _read_threads_from_env() -> int | None:
+    """The explicit read-ahead per part (0 = a plain stream), or None to pick by part count."""
+    if not (os.environ.get(S3_READ_THREADS_ENV) or "").strip():
+        return None
+    return _threads_from_env(S3_READ_THREADS_ENV, 0, S3_MAX_READ_THREADS)
+
+
+def _auto_read_threads(concurrency: int) -> int:
+    """Read-ahead per part so that about S3_READ_STREAMS streams run in all."""
+    return min(S3_MAX_READ_THREADS, -(-S3_READ_STREAMS // max(1, concurrency)))
 
 
 def _crc32_b64(data) -> str:
@@ -568,6 +605,99 @@ class _S3StreamReader:
         return False
 
 
+class _S3ReadAheadReader:
+    """Sequential reader that keeps a few ranged GETs in flight.
+
+    ``read(n)`` returns the next bytes in order, like a file. The object is fetched in
+    ``chunk_size`` ranges by up to ``threads`` workers, so memory is bounded by
+    ``chunk_size x (threads + 1)``. Every range must come from the same object version
+    (its ETag is checked), a short read is an error, and a failed range is raised by the
+    ``read`` that needs it.
+    """
+
+    def __init__(self, client, bucket: str, key: str, chunk_size: int, threads: int):
+        if chunk_size < 1 or threads < 1:
+            raise ValueError("chunk_size and threads must be positive")
+        self._client = client
+        self._bucket = bucket
+        self._key = key
+        self._chunk = chunk_size
+        self._threads = threads
+        self._pool: ThreadPoolExecutor | None = None
+        self._pending: deque[Future] = deque()
+        self._buf = b""
+        self._pos = 0
+        self._next = 0
+        self._size = 0
+        self._etag: str | None = None
+
+    def __enter__(self) -> _S3ReadAheadReader:
+        head = self._client.head_object(Bucket=self._bucket, Key=self._key)
+        self._size = head["ContentLength"]
+        self._etag = head.get("ETag")
+        if self._size:
+            self._pool = ThreadPoolExecutor(
+                max_workers=self._threads, thread_name_prefix="pgfanout-s3-get"
+            )
+            self._fill()
+        return self
+
+    def _fetch(self, start: int, end: int) -> bytes:
+        resp = self._client.get_object(
+            Bucket=self._bucket, Key=self._key, Range=f"bytes={start}-{end}"
+        )
+        body = resp["Body"]
+        try:
+            data = body.read()
+        finally:
+            body.close()
+        if len(data) != end - start + 1:
+            raise OSError(f"short read of s3://{self._bucket}/{self._key} at byte {start}")
+        etag = resp.get("ETag")
+        if self._etag and etag and etag != self._etag:
+            raise OSError(f"s3://{self._bucket}/{self._key} changed while it was being read")
+        return data
+
+    def _fill(self) -> None:
+        while self._pool and len(self._pending) < self._threads and self._next < self._size:
+            end = min(self._next + self._chunk, self._size) - 1
+            self._pending.append(self._pool.submit(self._fetch, self._next, end))
+            self._next = end + 1
+
+    def read(self, n: int = -1) -> bytes:
+        if self._pool is None and self._size:
+            raise ValueError("read from a closed reader")
+        parts: list[bytes] = []
+        want = None if n is None or n < 0 else n
+        while want is None or want > 0:
+            if self._pos >= len(self._buf):
+                if not self._pending:
+                    break
+                self._buf = self._pending.popleft().result()
+                self._pos = 0
+                self._fill()
+            take = (
+                len(self._buf) - self._pos
+                if want is None
+                else min(want, len(self._buf) - self._pos)
+            )
+            parts.append(self._buf[self._pos : self._pos + take])
+            self._pos += take
+            if want is not None:
+                want -= take
+        return parts[0] if len(parts) == 1 else b"".join(parts)
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        pool, self._pool = self._pool, None
+        for future in self._pending:
+            future.cancel()
+        self._pending.clear()
+        self._buf = b""
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return False
+
+
 class S3Blob(Blob):
     """Backend for ``s3://bucket/key`` URIs.
 
@@ -590,10 +720,16 @@ class S3Blob(Blob):
         client=None,
         part_size: int = S3_DEFAULT_PART_SIZE,
         upload_threads: int | None = None,
+        read_threads: int | None = None,
+        read_chunk_size: int = S3_READ_CHUNK_SIZE,
     ):
         self._bucket = bucket
         self._key = key
         self._part_size = part_size
+        # None means: PGFANOUT_S3_READ_THREADS if set, else chosen by open_stream from the
+        # number of parts read together; 0 reads one plain stream.
+        self._read_threads = _read_threads_from_env() if read_threads is None else read_threads
+        self._read_chunk = read_chunk_size
         # None means: PGFANOUT_S3_UPLOAD_THREADS, else the default.
         self._upload_threads = (
             _upload_threads_from_env() if upload_threads is None else upload_threads
@@ -622,6 +758,21 @@ class S3Blob(Blob):
         the whole object in memory.
         """
         return _S3StreamReader(self._get_client(), self._bucket, self._key)  # type: ignore[return-value]
+
+    def open_stream(self, concurrency: int = 1) -> BinaryIO:
+        """Read ahead with ranged GETs (see :class:`_S3ReadAheadReader`); a plain stream if off.
+
+        *concurrency* is how many blobs the caller reads at the same time; the fewer, the
+        more ranges each one keeps in flight.
+        """
+        threads = self._read_threads
+        if threads is None:
+            threads = _auto_read_threads(concurrency)
+        if threads <= 1:
+            return self.open_read()
+        return _S3ReadAheadReader(  # type: ignore[return-value]
+            self._get_client(), self._bucket, self._key, self._read_chunk, threads
+        )
 
     def size(self) -> int:
         try:
