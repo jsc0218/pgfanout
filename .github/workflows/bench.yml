@@ -190,7 +190,7 @@ jobs:
           python3 bench/bench.py \
             --variant base=pgfanout:/tmp/venv-base/bin \
             --variant pr=pgfanout:/tmp/venv-pr/bin \
-            --variant pg_dump=pgdump \
+            --variant pg_dump=pgdump@1 \
             --variant pr_1job=pgfanout:/tmp/venv-pr/bin@1 \
             --size-mb "$SIZE_MB" --repeats "$REPEATS" --jobs-sweep 4 \
             --out bench-results.json
@@ -208,7 +208,7 @@ jobs:
           echo "Fail on regression: ${ENFORCE}." >> "$GITHUB_STEP_SUMMARY"
           set +e
           python3 bench/compare.py bench-results.json \
-            --base base@4 --pr pr@4 --reference pg_dump@4 --single pr_1job \
+            --base base@4 --pr pr@4 --reference pg_dump --single pr_1job \
             --threshold "$THRESHOLD" $fail | tee report.md
           status=${PIPESTATUS[0]}
           cat report.md >> "$GITHUB_STEP_SUMMARY"
