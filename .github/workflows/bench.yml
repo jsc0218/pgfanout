@@ -48,7 +48,7 @@ name: Benchmark
 #     in the S3 read and write paths against a real S3 server, restore included.
 #     The runner is CPU-bound there: Postgres, psql, the TLS and checksum work in
 #     pgfanout and the S3 server all share the 2 physical cores, so a dump to S3
-#     scales from 1 to 2 jobs (about 1.4x) and not beyond. A client-side cost that
+#     scales from 1 to 2 jobs (about 1.4x) and little beyond. A client-side cost that
 #     the shared cores hide, such as boto3's trailing checksum removed in #19
 #     (35-43% on a dedicated host), may not show: reverting it moved the S3 dump
 #     by -1.4% with versitygw and by +0.9% to +2.7% with SeaweedFS. Check that

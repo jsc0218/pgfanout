@@ -111,7 +111,7 @@ base and the PR against it, and `compare.py` applies the same rules as for the
 local run. HTTPS matters because boto3 only wraps each part in its
 trailing-checksum encoding over TLS. It catches breakage and large slowdowns in
 the S3 read and write paths, but the runner's 2 physical cores are shared by
-Postgres, `psql`, pgfanout and the server, so a dump to S3 stops scaling after
+Postgres, `psql`, pgfanout and the server, so a dump to S3 scales little beyond
 2 jobs and a client-side cost can stay hidden. Use `--storage` on a dedicated
 machine for that. versitygw was chosen over SeaweedFS because it needs about a
 third of the CPU per dump, which leaves the runner's cores to the thing being
@@ -119,8 +119,11 @@ measured.
 
 ## One job against `pg_dump`
 
-The local report compares pgfanout with `pg_dump -Fd -Z 0 -j 1` (single job).
-They are not expected to take the same time, and the difference is not the
+The local report's `vs pg_dump-j1` column is pgfanout at 2 jobs against
+`pg_dump -Fd -Z 0 -j 1`; a higher `-j` does not help `pg_dump` on a single table
+(7.3s at 1, 2 and 4 jobs in a sweep), so its job count hardly matters on this
+dataset, and the one-job pgfanout row of the speedup table is the like-for-like
+single-thread figure. They are not expected to take the same time, and the difference is not the
 harness. `pg_dump` has no binary format for table data (its directory and custom
 formats carry text COPY), whereas pgfanout copies in binary, which is cheaper to
 produce and to load: on the CI runner a plain `psql` COPY of the table took 3.1s
