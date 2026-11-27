@@ -264,6 +264,11 @@ Python-level `aws-chunked` wrapper with a trailing checksum, which is much
 slower for 16 MiB parts. Checked against AWS S3, MinIO, Ceph RGW (Quincy and
 Squid) and moto; MinIO verifies the checksum, Ceph accepts it without checking.
 
+Over HTTPS the request body is not SHA-256 signed (`UNSIGNED-PAYLOAD`), because
+the part already carries that CRC32 and TLS protects it in transit; hashing every
+part as well was about a third of the client's CPU. Over plain HTTP the payload
+stays signed.
+
 ## 📝 Config file
 
 CLI flags can be defaulted from a TOML config.  Load order (first match wins):

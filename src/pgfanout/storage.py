@@ -270,8 +270,25 @@ def make_s3_client(
         kwargs["aws_access_key_id"] = aws_access_key_id
     if aws_secret_access_key is not None:
         kwargs["aws_secret_access_key"] = aws_secret_access_key
+    if _payload_signing_off(endpoint_url or os.environ.get("AWS_ENDPOINT_URL")):
+        from botocore.config import Config
+
+        kwargs["config"] = Config(s3={"payload_signing_enabled": False})
 
     return boto3.client(**kwargs)
+
+
+def _payload_signing_off(endpoint_url: str | None) -> bool:
+    """True when the request body need not be SHA-256 signed: the endpoint uses TLS.
+
+    Every part already carries our own CRC32, which S3 verifies, and TLS protects it
+    on the way, so signing the payload as well only costs CPU: botocore hashes each
+    part with SHA-256 whenever the checksum header is ours rather than its own, which
+    was about a third of the client CPU of an upload. Over plain HTTP the payload stays
+    signed (botocore would otherwise skip it there too).  No endpoint means AWS, which
+    is HTTPS.
+    """
+    return endpoint_url is None or urlparse(endpoint_url).scheme == "https"
 
 
 class _S3MultipartWriter:

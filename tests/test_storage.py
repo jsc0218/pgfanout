@@ -1531,3 +1531,62 @@ def test_s3_part_upload_avoids_botocores_aws_chunked_path(tiny_part_size):
     assert not isinstance(seen["body"], AwsChunkedWrapper)
     assert seen["body"].read() == body  # the part itself, unwrapped
     assert part["ChecksumCRC32"] == _expected_crc32(body)
+
+
+def _upload_part_headers(client, body, part_size):
+    """Run one part through the real writer and return the headers botocore built."""
+    from botocore.awsrequest import AWSResponse
+
+    class _EmptyBody:
+        content = b""
+
+        def stream(self, *a, **k):
+            return iter(())
+
+    seen = {}
+
+    def capture(request, **_):
+        seen["headers"] = {
+            k.lower(): v.decode() if isinstance(v, bytes) else v for k, v in request.headers.items()
+        }
+        return AWSResponse(request.url, 200, {"ETag": '"e1"'}, _EmptyBody())
+
+    client.meta.events.register("before-send.s3.UploadPart", capture)
+    w = S3Blob("b", "k", client=client, part_size=part_size).open_write()
+    w._upload_id = "UP1"
+    w._upload_part(1, body)
+    return seen["headers"]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "signed"),
+    [
+        (None, False),  # AWS, which is HTTPS
+        ("https://s3.example.invalid", False),
+        ("http://127.0.0.1:9", True),  # plain HTTP keeps its payload signature
+    ],
+)
+def test_s3_payload_is_signed_only_over_plain_http(endpoint, signed, monkeypatch, tiny_part_size):
+    """Each part carries our CRC32, so over TLS botocore need not SHA-256 the whole body."""
+    import hashlib
+
+    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
+    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
+    monkeypatch.delenv("AWS_S3_ENDPOINT_URL", raising=False)
+    client = make_s3_client(
+        endpoint_url=endpoint, aws_access_key_id="AKIATEST", aws_secret_access_key="secret"
+    )
+    body = b"z" * 64
+    headers = _upload_part_headers(client, body, tiny_part_size)
+    assert headers["x-amz-checksum-crc32"] == _expected_crc32(body)  # still verified by S3
+    expected = hashlib.sha256(body).hexdigest() if signed else "UNSIGNED-PAYLOAD"
+    assert headers["x-amz-content-sha256"] == expected
+
+
+def test_s3_payload_signing_follows_the_env_endpoint(monkeypatch, tiny_part_size):
+    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
+    monkeypatch.delenv("AWS_S3_ENDPOINT_URL", raising=False)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9")  # boto3's own, global variable
+    client = make_s3_client(aws_access_key_id="AKIATEST", aws_secret_access_key="secret")
+    headers = _upload_part_headers(client, b"q" * 8, tiny_part_size)
+    assert headers["x-amz-content-sha256"] != "UNSIGNED-PAYLOAD"

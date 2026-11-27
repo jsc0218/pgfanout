@@ -48,6 +48,10 @@ a header (the upload is created with `ChecksumAlgorithm=CRC32`, and each part's
 checksum is repeated in `CompleteMultipartUpload`), so a store that verifies it checks every part.
 boto3's default instead streams each part through a Python wrapper with a
 trailing checksum, which costs far more CPU under the GIL.
+Over TLS the body is also sent as `UNSIGNED-PAYLOAD` (`payload_signing_enabled`
+off for HTTPS endpoints): with our own checksum header botocore would otherwise
+SHA-256 every part for the request signature, which was about a third of the
+client CPU of an upload.
 
 ## Common to both paths
 
