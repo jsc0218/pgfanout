@@ -270,7 +270,7 @@ def make_s3_client(
         kwargs["aws_access_key_id"] = aws_access_key_id
     if aws_secret_access_key is not None:
         kwargs["aws_secret_access_key"] = aws_secret_access_key
-    if _payload_signing_off(endpoint_url or os.environ.get("AWS_ENDPOINT_URL")):
+    if _payload_signing_off(endpoint_url or os.environ.get("AWS_ENDPOINT_URL") or None):
         from botocore.config import Config
 
         kwargs["config"] = Config(s3={"payload_signing_enabled": False})
@@ -279,14 +279,16 @@ def make_s3_client(
 
 
 def _payload_signing_off(endpoint_url: str | None) -> bool:
-    """True when the request body need not be SHA-256 signed: the endpoint uses TLS.
+    """True when request bodies need not be SHA-256 signed: the endpoint uses TLS.
 
     Every part already carries our own CRC32, which S3 verifies, and TLS protects it
     on the way, so signing the payload as well only costs CPU: botocore hashes each
     part with SHA-256 whenever the checksum header is ours rather than its own, which
-    was about a third of the client CPU of an upload. Over plain HTTP the payload stays
-    signed (botocore would otherwise skip it there too).  No endpoint means AWS, which
-    is HTTPS.
+    was about a third of the client CPU of an upload. The option is client-wide, so
+    over HTTPS every request on the client is sent as ``UNSIGNED-PAYLOAD``; apart
+    from parts, the only bodies are the small XML of CompleteMultipartUpload and
+    DeleteObjects. Over plain HTTP the payload stays signed: nothing but the
+    signature binds the body there. No endpoint means AWS, which is HTTPS.
     """
     return endpoint_url is None or urlparse(endpoint_url).scheme == "https"
 

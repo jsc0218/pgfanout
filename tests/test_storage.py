@@ -1583,10 +1583,60 @@ def test_s3_payload_is_signed_only_over_plain_http(endpoint, signed, monkeypatch
     assert headers["x-amz-content-sha256"] == expected
 
 
-def test_s3_payload_signing_follows_the_env_endpoint(monkeypatch, tiny_part_size):
-    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
-    monkeypatch.delenv("AWS_S3_ENDPOINT_URL", raising=False)
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9")  # boto3's own, global variable
+@pytest.mark.parametrize("name", ["AWS_ENDPOINT_URL_S3", "AWS_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL"])
+@pytest.mark.parametrize(
+    ("url", "signed"), [("https://s3.example.invalid", False), ("http://127.0.0.1:9", True)]
+)
+def test_s3_payload_signing_follows_the_env_endpoint(
+    name, url, signed, monkeypatch, tiny_part_size
+):
+    for var in ("AWS_ENDPOINT_URL_S3", "AWS_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv(name, url)
     client = make_s3_client(aws_access_key_id="AKIATEST", aws_secret_access_key="secret")
     headers = _upload_part_headers(client, b"q" * 8, tiny_part_size)
-    assert headers["x-amz-content-sha256"] != "UNSIGNED-PAYLOAD"
+    assert (headers["x-amz-content-sha256"] != "UNSIGNED-PAYLOAD") is signed
+
+
+def test_s3_payload_signing_off_is_client_wide_over_https(monkeypatch):
+    """The botocore option covers every request on the client, not only the part uploads."""
+    from botocore.awsrequest import AWSResponse
+
+    class _Body:
+        content = b"<r/>"
+
+        def stream(self, *a, **k):
+            return iter([b"<r/>"])
+
+    for var in ("AWS_ENDPOINT_URL_S3", "AWS_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL"):
+        monkeypatch.delenv(var, raising=False)
+    sent = {}
+
+    def capture(request, event_name, **_):
+        value = request.headers["X-Amz-Content-SHA256"]
+        sent[event_name.rsplit(".", 1)[-1]] = value.decode() if isinstance(value, bytes) else value
+        return AWSResponse(request.url, 200, {}, _Body())
+
+    client = make_s3_client(
+        endpoint_url="https://s3.example.invalid",
+        aws_access_key_id="AKIATEST",
+        aws_secret_access_key="secret",
+    )
+    client.meta.events.register("before-send.s3.*", capture)
+    parts = [{"PartNumber": 1, "ETag": "e", "ChecksumCRC32": "AAAAAA=="}]
+    client.complete_multipart_upload(
+        Bucket="b", Key="k", UploadId="u", MultipartUpload={"Parts": parts}
+    )
+    client.get_object(Bucket="b", Key="k")
+    client.delete_object(Bucket="b", Key="k")
+    assert set(sent.values()) == {"UNSIGNED-PAYLOAD"}
+    assert set(sent) == {"CompleteMultipartUpload", "GetObject", "DeleteObject"}
+
+
+def test_s3_an_empty_endpoint_variable_means_aws(monkeypatch, tiny_part_size):
+    for var in ("AWS_ENDPOINT_URL_S3", "AWS_S3_ENDPOINT_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "")  # boto3 reads that as unset: AWS, over HTTPS
+    client = make_s3_client(aws_access_key_id="AKIATEST", aws_secret_access_key="secret")
+    headers = _upload_part_headers(client, b"q" * 8, tiny_part_size)
+    assert headers["x-amz-content-sha256"] == "UNSIGNED-PAYLOAD"
