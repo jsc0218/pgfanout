@@ -1533,6 +1533,14 @@ def test_s3_part_upload_avoids_botocores_aws_chunked_path(tiny_part_size):
     assert part["ChecksumCRC32"] == _expected_crc32(body)
 
 
+@pytest.fixture
+def no_endpoint_env(monkeypatch):
+    """No S3 endpoint from the environment, so each test sets exactly the one it checks."""
+    for var in ("AWS_ENDPOINT_URL_S3", "AWS_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL"):
+        monkeypatch.delenv(var, raising=False)
+    return monkeypatch
+
+
 def _upload_part_headers(client, body, part_size):
     """Run one part through the real writer and return the headers botocore built."""
     from botocore.awsrequest import AWSResponse
@@ -1566,13 +1574,12 @@ def _upload_part_headers(client, body, part_size):
         ("http://127.0.0.1:9", True),  # plain HTTP keeps its payload signature
     ],
 )
-def test_s3_payload_is_signed_only_over_plain_http(endpoint, signed, monkeypatch, tiny_part_size):
+def test_s3_payload_is_signed_only_over_plain_http(
+    endpoint, signed, no_endpoint_env, tiny_part_size
+):
     """Each part carries our CRC32, so over TLS botocore need not SHA-256 the whole body."""
     import hashlib
 
-    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
-    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
-    monkeypatch.delenv("AWS_S3_ENDPOINT_URL", raising=False)
     client = make_s3_client(
         endpoint_url=endpoint, aws_access_key_id="AKIATEST", aws_secret_access_key="secret"
     )
@@ -1588,17 +1595,15 @@ def test_s3_payload_is_signed_only_over_plain_http(endpoint, signed, monkeypatch
     ("url", "signed"), [("https://s3.example.invalid", False), ("http://127.0.0.1:9", True)]
 )
 def test_s3_payload_signing_follows_the_env_endpoint(
-    name, url, signed, monkeypatch, tiny_part_size
+    name, url, signed, no_endpoint_env, tiny_part_size
 ):
-    for var in ("AWS_ENDPOINT_URL_S3", "AWS_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv(name, url)
+    no_endpoint_env.setenv(name, url)
     client = make_s3_client(aws_access_key_id="AKIATEST", aws_secret_access_key="secret")
     headers = _upload_part_headers(client, b"q" * 8, tiny_part_size)
     assert (headers["x-amz-content-sha256"] != "UNSIGNED-PAYLOAD") is signed
 
 
-def test_s3_payload_signing_off_is_client_wide_over_https(monkeypatch):
+def test_s3_payload_signing_off_is_client_wide_over_https(no_endpoint_env):
     """The botocore option covers every request on the client, not only the part uploads."""
     from botocore.awsrequest import AWSResponse
 
@@ -1608,8 +1613,6 @@ def test_s3_payload_signing_off_is_client_wide_over_https(monkeypatch):
         def stream(self, *a, **k):
             return iter([b"<r/>"])
 
-    for var in ("AWS_ENDPOINT_URL_S3", "AWS_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL"):
-        monkeypatch.delenv(var, raising=False)
     sent = {}
 
     def capture(request, event_name, **_):
@@ -1633,10 +1636,23 @@ def test_s3_payload_signing_off_is_client_wide_over_https(monkeypatch):
     assert set(sent) == {"CompleteMultipartUpload", "GetObject", "DeleteObject"}
 
 
-def test_s3_an_empty_endpoint_variable_means_aws(monkeypatch, tiny_part_size):
-    for var in ("AWS_ENDPOINT_URL_S3", "AWS_S3_ENDPOINT_URL"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "")  # boto3 reads that as unset: AWS, over HTTPS
+def test_s3_an_empty_endpoint_variable_means_aws(no_endpoint_env, tiny_part_size):
+    no_endpoint_env.setenv("AWS_ENDPOINT_URL", "")  # boto3 reads that as unset: AWS, over HTTPS
     client = make_s3_client(aws_access_key_id="AKIATEST", aws_secret_access_key="secret")
     headers = _upload_part_headers(client, b"q" * 8, tiny_part_size)
     assert headers["x-amz-content-sha256"] == "UNSIGNED-PAYLOAD"
+
+
+@pytest.mark.parametrize(
+    "endpoint", [None, "https://ceph.example.invalid:7480", "http://127.0.0.1:9"]
+)
+def test_s3_payload_signing_keeps_the_users_s3_settings(endpoint, no_endpoint_env, tmp_path):
+    """A path-style or accelerate setting in ~/.aws/config must survive our s3 option."""
+    config = tmp_path / "config"
+    config.write_text("[default]\ns3 =\n    addressing_style = path\n")
+    no_endpoint_env.setenv("AWS_CONFIG_FILE", str(config))
+    no_endpoint_env.setattr(boto3, "DEFAULT_SESSION", None)  # a new session reads the file
+    client = make_s3_client(
+        endpoint_url=endpoint, aws_access_key_id="AKIATEST", aws_secret_access_key="secret"
+    )
+    assert client.meta.config.s3["addressing_style"] == "path"
