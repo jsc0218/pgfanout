@@ -210,6 +210,29 @@ jobs:
           fi
           exit $status
 
+      # The dump benchmark above writes to local disk, so it cannot see the
+      # cost of the S3 writer. This one runs the real relay and S3 writer
+      # against a local HTTPS server that discards the data (bench/s3_relay.py),
+      # which is where boto3's aws-chunked trailer checksum cost 35-43% of a
+      # dump. It runs even if the step above failed, so both results are shown.
+      - name: S3 upload, client side
+        if: ${{ !cancelled() }}
+        run: |
+          fail=""
+          if [ "$ENFORCE" = "true" ]; then fail="--fail"; fi
+          set +e
+          python3 bench/s3_relay.py \
+            --variant base=/tmp/venv-base/bin --variant pr=/tmp/venv-pr/bin \
+            --repeats "$REPEATS" --threshold "$THRESHOLD" \
+            --out s3-relay.json --report s3-relay.md $fail
+          status=$?
+          [ -f s3-relay.md ] && cat s3-relay.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            what=$(grep -m1 'Possible regression' s3-relay.md 2>/dev/null | sed 's/\*//g')
+            echo "::error title=S3 upload benchmark::${what:-s3_relay.py failed} See the job summary."
+          fi
+          exit $status
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -217,3 +240,5 @@ jobs:
           path: |
             bench-results.json
             report.md
+            s3-relay.json
+            s3-relay.md
