@@ -221,7 +221,10 @@ jobs:
       # The same dump and restore, through S3. pgfanout talks to a local
       # SeaweedFS over HTTPS (boto3 only wraps each part for its trailing
       # checksum over TLS, which is the slowdown #19 removed), with its data under
-      # /mnt (tmpfs filled up: overwritten data is only reclaimed by a vacuum).
+      # /mnt (tmpfs filled up). Overwritten data is only reclaimed by a vacuum, and
+      # every volume takes a slot, so the slot limit is left to the free disk
+      # (-volume.max=0): with a fixed 40 the server ran out ("Not enough data
+      # nodes found") and answered uploads with a 500.
       # The release is pinned and
       # checked against its SHA-256. Like the steps above, this runs even if
       # an earlier one failed.
@@ -239,7 +242,7 @@ jobs:
           sudo install -d -o "$USER" /mnt/weed
           nohup ./weed server -dir=/mnt/weed -ip=127.0.0.1 -s3 -s3.port=8333 \
             -s3.cert.file=/tmp/weed/cert.pem -s3.key.file=/tmp/weed/key.pem \
-            -master.volumeSizeLimitMB=512 -volume.max=40 > /tmp/weed/log.txt 2>&1 &
+            -master.volumeSizeLimitMB=512 -volume.max=0 > /tmp/weed/log.txt 2>&1 &
           for _ in $(seq 1 60); do
             curl -sk --max-time 2 -o /dev/null https://127.0.0.1:8333/ && exit 0
             sleep 1
