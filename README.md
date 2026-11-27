@@ -264,6 +264,18 @@ Python-level `aws-chunked` wrapper with a trailing checksum, which is much
 slower for 16 MiB parts. Checked against AWS S3, MinIO, Ceph RGW (Quincy and
 Squid) and moto; MinIO verifies the checksum, Ceph accepts it without checking.
 
+Over HTTPS requests are sent with `UNSIGNED-PAYLOAD` instead of a SHA-256 of the
+body: the part already carries that CRC32, TLS protects it in transit, and hashing
+every part as well was about a third of the client's CPU. The setting is
+client-wide, so it covers every request; apart from the parts, the only bodies are
+the small XML of `CompleteMultipartUpload` and `DeleteObjects`. Over plain HTTP
+the payload stays signed. Checked against AWS S3, versitygw, SeaweedFS and moto;
+a store that rejects `UNSIGNED-PAYLOAD` would fail the upload with its own error.
+The endpoint is read from `AWS_ENDPOINT_URL_S3`, `AWS_S3_ENDPOINT_URL` or
+`AWS_ENDPOINT_URL`, so an `endpoint_url` set only in `~/.aws/config` is not seen
+(an HTTP endpoint configured there would lose the payload signature, not the CRC32
+check).
+
 ## 📝 Config file
 
 CLI flags can be defaulted from a TOML config.  Load order (first match wins):

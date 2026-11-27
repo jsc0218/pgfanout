@@ -1531,3 +1531,128 @@ def test_s3_part_upload_avoids_botocores_aws_chunked_path(tiny_part_size):
     assert not isinstance(seen["body"], AwsChunkedWrapper)
     assert seen["body"].read() == body  # the part itself, unwrapped
     assert part["ChecksumCRC32"] == _expected_crc32(body)
+
+
+@pytest.fixture
+def no_endpoint_env(monkeypatch):
+    """No S3 endpoint from the environment, so each test sets exactly the one it checks."""
+    for var in ("AWS_ENDPOINT_URL_S3", "AWS_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL"):
+        monkeypatch.delenv(var, raising=False)
+    return monkeypatch
+
+
+def _upload_part_headers(client, body, part_size):
+    """Run one part through the real writer and return the headers botocore built."""
+    from botocore.awsrequest import AWSResponse
+
+    class _EmptyBody:
+        content = b""
+
+        def stream(self, *a, **k):
+            return iter(())
+
+    seen = {}
+
+    def capture(request, **_):
+        seen["headers"] = {
+            k.lower(): v.decode() if isinstance(v, bytes) else v for k, v in request.headers.items()
+        }
+        return AWSResponse(request.url, 200, {"ETag": '"e1"'}, _EmptyBody())
+
+    client.meta.events.register("before-send.s3.UploadPart", capture)
+    w = S3Blob("b", "k", client=client, part_size=part_size).open_write()
+    w._upload_id = "UP1"
+    w._upload_part(1, body)
+    return seen["headers"]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "signed"),
+    [
+        (None, False),  # AWS, which is HTTPS
+        ("https://s3.example.invalid", False),
+        ("http://127.0.0.1:9", True),  # plain HTTP keeps its payload signature
+    ],
+)
+def test_s3_payload_is_signed_only_over_plain_http(
+    endpoint, signed, no_endpoint_env, tiny_part_size
+):
+    """Each part carries our CRC32, so over TLS botocore need not SHA-256 the whole body."""
+    import hashlib
+
+    client = make_s3_client(
+        endpoint_url=endpoint, aws_access_key_id="AKIATEST", aws_secret_access_key="secret"
+    )
+    body = b"z" * 64
+    headers = _upload_part_headers(client, body, tiny_part_size)
+    assert headers["x-amz-checksum-crc32"] == _expected_crc32(body)  # still verified by S3
+    expected = hashlib.sha256(body).hexdigest() if signed else "UNSIGNED-PAYLOAD"
+    assert headers["x-amz-content-sha256"] == expected
+
+
+@pytest.mark.parametrize("name", ["AWS_ENDPOINT_URL_S3", "AWS_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL"])
+@pytest.mark.parametrize(
+    ("url", "signed"), [("https://s3.example.invalid", False), ("http://127.0.0.1:9", True)]
+)
+def test_s3_payload_signing_follows_the_env_endpoint(
+    name, url, signed, no_endpoint_env, tiny_part_size
+):
+    no_endpoint_env.setenv(name, url)
+    client = make_s3_client(aws_access_key_id="AKIATEST", aws_secret_access_key="secret")
+    headers = _upload_part_headers(client, b"q" * 8, tiny_part_size)
+    assert (headers["x-amz-content-sha256"] != "UNSIGNED-PAYLOAD") is signed
+
+
+def test_s3_payload_signing_off_is_client_wide_over_https(no_endpoint_env):
+    """The botocore option covers every request on the client, not only the part uploads."""
+    from botocore.awsrequest import AWSResponse
+
+    class _Body:
+        content = b"<r/>"
+
+        def stream(self, *a, **k):
+            return iter([b"<r/>"])
+
+    sent = {}
+
+    def capture(request, event_name, **_):
+        value = request.headers["X-Amz-Content-SHA256"]
+        sent[event_name.rsplit(".", 1)[-1]] = value.decode() if isinstance(value, bytes) else value
+        return AWSResponse(request.url, 200, {}, _Body())
+
+    client = make_s3_client(
+        endpoint_url="https://s3.example.invalid",
+        aws_access_key_id="AKIATEST",
+        aws_secret_access_key="secret",
+    )
+    client.meta.events.register("before-send.s3.*", capture)
+    parts = [{"PartNumber": 1, "ETag": "e", "ChecksumCRC32": "AAAAAA=="}]
+    client.complete_multipart_upload(
+        Bucket="b", Key="k", UploadId="u", MultipartUpload={"Parts": parts}
+    )
+    client.get_object(Bucket="b", Key="k")
+    client.delete_object(Bucket="b", Key="k")
+    assert set(sent.values()) == {"UNSIGNED-PAYLOAD"}
+    assert set(sent) == {"CompleteMultipartUpload", "GetObject", "DeleteObject"}
+
+
+def test_s3_an_empty_endpoint_variable_means_aws(no_endpoint_env, tiny_part_size):
+    no_endpoint_env.setenv("AWS_ENDPOINT_URL", "")  # boto3 reads that as unset: AWS, over HTTPS
+    client = make_s3_client(aws_access_key_id="AKIATEST", aws_secret_access_key="secret")
+    headers = _upload_part_headers(client, b"q" * 8, tiny_part_size)
+    assert headers["x-amz-content-sha256"] == "UNSIGNED-PAYLOAD"
+
+
+@pytest.mark.parametrize(
+    "endpoint", [None, "https://ceph.example.invalid:7480", "http://127.0.0.1:9"]
+)
+def test_s3_payload_signing_keeps_the_users_s3_settings(endpoint, no_endpoint_env, tmp_path):
+    """A path-style or accelerate setting in ~/.aws/config must survive our s3 option."""
+    config = tmp_path / "config"
+    config.write_text("[default]\ns3 =\n    addressing_style = path\n")
+    no_endpoint_env.setenv("AWS_CONFIG_FILE", str(config))
+    no_endpoint_env.setattr(boto3, "DEFAULT_SESSION", None)  # a new session reads the file
+    client = make_s3_client(
+        endpoint_url=endpoint, aws_access_key_id="AKIATEST", aws_secret_access_key="secret"
+    )
+    assert client.meta.config.s3["addressing_style"] == "path"
