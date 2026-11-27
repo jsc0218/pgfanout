@@ -6,7 +6,10 @@ base branch and the pull request) and flags the pull request when it is
 slower than the base by more than --threshold. A change smaller than
 --min-abs seconds is ignored, so tiny absolute differences on a fast
 benchmark cannot trip the check. An optional reference variant (e.g.
-pg_dump) is reported as a ratio for context and never gates.
+pg_dump) is reported as a ratio for context and never gates, and neither does
+--single, a variant of the same build run with one job, whose speedup over the
+--pr variant is shown as a second table. For a --jobs-sweep run the variants
+are named NAME@JOBS (e.g. --base base@2 --pr pr@2 --single pr@1).
 
 The Markdown goes to stdout. The exit status is 1 only when a regression
 was found and --fail was given.
@@ -55,11 +58,13 @@ def main() -> None:
 
     data = json.load(open(args.results))
     meta, res = data["meta"], data["results"]
-    for name in (args.base, args.pr, *([args.single] if args.single else [])):
+    wanted = [args.base, args.pr, args.reference, args.single]
+    for name in (n for n in wanted if n):
         if name not in res:
             sys.exit(f"variant {name!r} not in results (have: {', '.join(res)})")
 
     size_mb = meta["source_db_bytes"] / 1e6
+    has_ref = bool(args.reference)
     regressions: list[str] = []
     rows = []
     for phase, key in (("dump", "dump_s"), ("restore", "restore_s")):
@@ -70,25 +75,31 @@ def main() -> None:
         if bad:
             regressions.append(f"{phase} {delta:+.0%}")
         ref = ""
-        if args.reference and args.reference in res:
+        if has_ref:
             ref_med = statistics.median(res[args.reference][key])
             ref = f"{ref_med / pr:.2f}x faster" if pr < ref_med else f"{pr / ref_med:.2f}x slower"
-        rows.append(
+        row = (
             f"| {phase} | {base:.1f}s ({spread(res[args.base][key])}) "
             f"| {pr:.1f}s ({spread(res[args.pr][key])}) | {delta:+.1%} "
-            f"| {size_mb / pr:.0f} MB/s | {ref or '-'} | {'regression' if bad else 'ok'} |"
+            f"| {size_mb / pr:.0f} MB/s |"
         )
+        if has_ref:
+            row += f" {ref} |"
+        rows.append(row + f" {'regression' if bad else 'ok'} |")
 
-    ref_hdr = f"vs {args.reference}" if args.reference else "vs reference"
+    jobs = res[args.pr].get("jobs", meta["jobs"])
     print(f"### {args.title}\n")
     print(
-        f"{size_mb:.0f} MB database, {meta['jobs']} jobs, median of {meta['repeats']} "
+        f"{size_mb:.0f} MB database, {jobs} jobs, median of {meta['repeats']} "
         f"interleaved runs, {cpu_text(meta)}, PostgreSQL {meta['server_version']}"
         f"{', fsync off' if meta.get('fsync_off') else ''}. "
         f"Threshold: {args.threshold:.0%} (and over {args.min_abs:g}s).\n"
     )
-    print(f"| phase | {args.base} | {args.pr} | change | pr throughput | {ref_hdr} | verdict |")
-    print("|---|---|---|---|---|---|---|")
+    head = f"| phase | {args.base} | {args.pr} | change | pr throughput |"
+    if has_ref:
+        head += f" vs {args.reference} |"
+    print(head + " verdict |")
+    print("|---|---|---|---|---|" + ("---|" if has_ref else "") + "---|")
     print("\n".join(rows))
     print()
     if regressions:

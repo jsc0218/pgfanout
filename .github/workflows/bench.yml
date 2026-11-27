@@ -5,11 +5,14 @@ name: Benchmark
 # What it does
 #   Builds the base branch and the PR into separate virtualenvs and runs
 #   bench/bench.py on both in one job, against one PostgreSQL service
-#   container, together with pg_dump/pg_restore as a reference. Rounds are
-#   interleaved with the order rotated, and a warm-up round is discarded, so
-#   noise on the shared runner hits every variant equally. bench/compare.py
-#   writes a table to the job summary and flags a PR that is slower than the
-#   base by more than 5% (and by more than 0.2s) on the median of 5 rounds.
+#   container, at 1 and 2 jobs, together with pg_dump -j 1 as a reference:
+#   first dumping to local disk, then through S3 (a local versitygw). Rounds
+#   are interleaved with the order rotated, and a warm-up round is discarded,
+#   so noise on the shared runner hits every variant equally. bench/compare.py
+#   writes a table per run to the job summary and flags a PR that is slower
+#   than the base at 2 jobs by more than 5% (and by more than 0.2s) on the
+#   median of 5 rounds, in either run. It also shows the PR's speedup over one
+#   job, which never gates.
 #
 # Why it can be trusted, and where it cannot
 #   * It is built to catch regressions, not to produce absolute numbers. The
@@ -32,6 +35,11 @@ name: Benchmark
 #     kept from being flagged only by the 0.2s floor, which is 7-13% of a dump
 #     here. So the floor is what makes 5% usable, and a single flagged dump
 #     result should be re-run before it is treated as a regression.
+#     (Those 18 runs were the local run at 4 jobs. The current setup, at 2 jobs,
+#     differed by -6.0% to +1.4% on local dump (the -6.0% was 0.1s), -0.8% to
+#     +0.4% on local restore, +0.4% to +1.1% on S3 dump and -1.2% to +0.4% on S3
+#     restore over three runs; its 2-job speedup over one job varied by about
+#     0.1x between VMs, which is why it is shown and not gated.)
 #   * Server and clients share the runner's 4 vCPUs, which are 2 physical
 #     cores with 2 hyper-threads each. A worker costs about 1.4 cores (server
 #     backend plus psql), so the speedup here is capped well below the number
@@ -42,9 +50,9 @@ name: Benchmark
 #     pgfanout and the S3 server all share the 2 physical cores, so a dump to S3
 #     scales from 1 to 2 jobs (about 1.4x) and not beyond. A client-side cost that
 #     the shared cores hide, such as boto3's trailing checksum removed in #19
-#     (35-43% on a dedicated host), may not show; with SeaweedFS as the server
-#     reverting it moved the dump by only 1-3%. Check that kind of change with
-#     bench.py --storage on a dedicated machine.
+#     (35-43% on a dedicated host), may not show: reverting it moved the S3 dump
+#     by -1.4% with versitygw and by +0.9% to +2.7% with SeaweedFS. Check that
+#     kind of change with bench.py --storage on a dedicated machine.
 #   * The dataset is one plain 795 MB table with no indexes, so it does not
 #     exercise index builds or many-table parallelism.
 #
@@ -192,11 +200,12 @@ jobs:
           python3 bench/bench.py \
             --variant base=pgfanout:/tmp/venv-base/bin \
             --variant pr=pgfanout:/tmp/venv-pr/bin \
-            --variant pg_dump=pgdump@1 \
+            --variant pg_dump-j1=pgdump@1 \
             --size-mb "$SIZE_MB" --repeats "$REPEATS" --jobs-sweep 1,2 \
             --out bench-results.json
 
       - name: Compare and report
+        if: ${{ !cancelled() && hashFiles('bench-results.json') != '' }}
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: |
@@ -209,7 +218,7 @@ jobs:
           echo "Fail on regression: ${ENFORCE}." >> "$GITHUB_STEP_SUMMARY"
           set +e
           python3 bench/compare.py bench-results.json \
-            --base base@2 --pr pr@2 --reference pg_dump --single pr@1 \
+            --base base@2 --pr pr@2 --reference pg_dump-j1 --single pr@1 \
             --threshold "$THRESHOLD" $fail | tee report.md
           status=${PIPESTATUS[0]}
           cat report.md >> "$GITHUB_STEP_SUMMARY"
@@ -273,7 +282,7 @@ jobs:
         run: tail -40 /tmp/vgw/log.txt || true
 
       - name: Compare and report (S3)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && hashFiles('bench-results-s3.json') != '' }}
         run: |
           fail=""
           if [ "$ENFORCE" = "true" ]; then fail="--fail"; fi

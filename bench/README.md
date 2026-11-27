@@ -152,9 +152,11 @@ the measured rounds.
 The **Benchmark** workflow runs this on pull requests that touch `src/` or
 `bench/` (the base branch against the PR, on the same runner) and on every
 push to `main` that touches them (the new commit against the one before it).
-It can also be started by hand from the Actions tab. It fails the job when
-`compare.py` finds a regression (a manual run can turn that off with the
-`enforce` input), and it never runs on a schedule.
+It can also be started by hand from the Actions tab. It runs the dump and
+restore to local disk and then through S3 (see above), at 1 and 2 jobs, and
+fails the job when `compare.py` finds a regression at 2 jobs in either (a
+manual run can turn that off with the `enforce` input). It never runs on a
+schedule.
 How it works, how stable it has been, and what it cannot detect (the runner
 has 2 physical cores with hyper-threads, and the server shares them with the
 clients) is documented at the top of
