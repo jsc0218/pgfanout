@@ -20,8 +20,11 @@ boto3, the AWS CLI, and our tool.
 
 from __future__ import annotations
 
+import base64
 import os
+import struct
 import tempfile
+import zlib
 from abc import ABC, abstractmethod
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -186,6 +189,15 @@ def _upload_threads_from_env() -> int:
     return value
 
 
+def _crc32_b64(data) -> str:
+    """CRC32 of *data* in the form S3 expects (big-endian, base64).
+
+    Computed here, and sent as a plain header, because boto3's default does the
+    same job through a Python-level ``aws-chunked`` wrapper that is much slower.
+    """
+    return base64.b64encode(struct.pack(">I", zlib.crc32(data))).decode("ascii")
+
+
 def _env_bool(name: str, default: bool | None = None) -> bool | None:
     """Parse a boolean-ish env var.  Empty/unset returns *default*."""
     raw = os.environ.get(name)
@@ -285,6 +297,8 @@ class _S3MultipartWriter:
       once the uploads still in flight have finished (aborting earlier could
       let a late part land after the abort). ``upload_threads=0`` uploads in
       the calling thread.
+    * Every part carries a CRC32 computed here, and the upload is created with
+      the same algorithm, so a store that verifies it checks each part.
     """
 
     def __init__(self, client, bucket: str, key: str, part_size: int, upload_threads: int = 0):
@@ -306,7 +320,9 @@ class _S3MultipartWriter:
         self._closed = False
 
     def __enter__(self) -> _S3MultipartWriter:
-        resp = self._client.create_multipart_upload(Bucket=self._bucket, Key=self._key)
+        resp = self._client.create_multipart_upload(
+            Bucket=self._bucket, Key=self._key, ChecksumAlgorithm="CRC32"
+        )
         self._upload_id = resp["UploadId"]
         if self._upload_threads:
             self._pool = ThreadPoolExecutor(
@@ -334,14 +350,17 @@ class _S3MultipartWriter:
         return len(data)
 
     def _upload_part(self, part_number: int, body: bytes) -> dict:
+        checksum = _crc32_b64(body)
         resp = self._client.upload_part(
             Bucket=self._bucket,
             Key=self._key,
             PartNumber=part_number,
             UploadId=self._upload_id,
             Body=body,
+            ChecksumCRC32=checksum,
         )
-        return {"PartNumber": part_number, "ETag": resp["ETag"]}
+        # CompleteMultipartUpload must repeat each part's checksum.
+        return {"PartNumber": part_number, "ETag": resp["ETag"], "ChecksumCRC32": checksum}
 
     def _reap_oldest(self) -> None:
         """Wait for the oldest in-flight part; re-raises its upload error."""

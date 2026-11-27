@@ -296,7 +296,7 @@ def _stub_multipart_upload(stub, bucket, key, parts: list[bytes], upload_id="UP1
     stub.add_response(
         "create_multipart_upload",
         {"UploadId": upload_id, "Bucket": bucket, "Key": key},
-        expected_params={"Bucket": bucket, "Key": key},
+        expected_params={"Bucket": bucket, "Key": key, "ChecksumAlgorithm": "CRC32"},
     )
     for i, body in enumerate(parts, 1):
         stub.add_response(
@@ -308,6 +308,7 @@ def _stub_multipart_upload(stub, bucket, key, parts: list[bytes], upload_id="UP1
                 "PartNumber": i,
                 "UploadId": upload_id,
                 "Body": body,
+                "ChecksumCRC32": _expected_crc32(body),
             },
         )
     stub.add_response(
@@ -319,7 +320,12 @@ def _stub_multipart_upload(stub, bucket, key, parts: list[bytes], upload_id="UP1
             "UploadId": upload_id,
             "MultipartUpload": {
                 "Parts": [
-                    {"PartNumber": i, "ETag": f'"etag-{i}"'} for i in range(1, len(parts) + 1)
+                    {
+                        "PartNumber": i,
+                        "ETag": f'"etag-{i}"',
+                        "ChecksumCRC32": _expected_crc32(parts[i - 1]),
+                    }
+                    for i in range(1, len(parts) + 1)
                 ]
             },
         },
@@ -387,7 +393,7 @@ def test_s3_blob_write_exception_aborts_upload(tiny_part_size):
     stub.add_response(
         "create_multipart_upload",
         {"UploadId": "UP1", "Bucket": "b", "Key": "k"},
-        expected_params={"Bucket": "b", "Key": "k"},
+        expected_params={"Bucket": "b", "Key": "k", "ChecksumAlgorithm": "CRC32"},
     )
     stub.add_response(
         "abort_multipart_upload",
@@ -410,7 +416,7 @@ def test_s3_blob_write_empty_falls_back_to_put_object(tiny_part_size):
     stub.add_response(
         "create_multipart_upload",
         {"UploadId": "UP1", "Bucket": "b", "Key": "empty"},
-        expected_params={"Bucket": "b", "Key": "empty"},
+        expected_params={"Bucket": "b", "Key": "empty", "ChecksumAlgorithm": "CRC32"},
     )
     stub.add_response(
         "abort_multipart_upload",
@@ -449,7 +455,7 @@ def test_s3_blob_write_abort_on_complete_failure(tiny_part_size):
     stub.add_response(
         "create_multipart_upload",
         {"UploadId": "UP1", "Bucket": "b", "Key": "k"},
-        expected_params={"Bucket": "b", "Key": "k"},
+        expected_params={"Bucket": "b", "Key": "k", "ChecksumAlgorithm": "CRC32"},
     )
     stub.add_response(
         "upload_part",
@@ -460,6 +466,7 @@ def test_s3_blob_write_abort_on_complete_failure(tiny_part_size):
             "PartNumber": 1,
             "UploadId": "UP1",
             "Body": b"hello",
+            "ChecksumCRC32": _expected_crc32(b"hello"),
         },
     )
     stub.add_client_error(
@@ -500,7 +507,7 @@ def test_s3_blob_write_abort_on_keyboard_interrupt(tiny_part_size):
     stub.add_response(
         "create_multipart_upload",
         {"UploadId": "UP1", "Bucket": "b", "Key": "k"},
-        expected_params={"Bucket": "b", "Key": "k"},
+        expected_params={"Bucket": "b", "Key": "k", "ChecksumAlgorithm": "CRC32"},
     )
     stub.add_response(
         "upload_part",
@@ -511,6 +518,7 @@ def test_s3_blob_write_abort_on_keyboard_interrupt(tiny_part_size):
             "PartNumber": 1,
             "UploadId": "UP1",
             "Body": b"hello",
+            "ChecksumCRC32": _expected_crc32(b"hello"),
         },
     )
 
@@ -554,7 +562,7 @@ def test_s3_blob_write_abort_on_trailing_flush_failure(tiny_part_size):
     stub.add_response(
         "create_multipart_upload",
         {"UploadId": "UP1", "Bucket": "b", "Key": "k"},
-        expected_params={"Bucket": "b", "Key": "k"},
+        expected_params={"Bucket": "b", "Key": "k", "ChecksumAlgorithm": "CRC32"},
     )
     stub.add_client_error(
         "upload_part",
@@ -1044,7 +1052,7 @@ def test_localize_s3_blob_missing_temp_unlink_is_safe():
 class _FakeS3:
     """Thread-safe in-memory S3 client that records what happened, and when."""
 
-    def __init__(self, *, delay=0.0, fail_part=None, gate=None):
+    def __init__(self, *, delay=0.0, fail_part=None, gate=None, corrupt=False):
         import threading
 
         self.lock = threading.Lock()
@@ -1059,8 +1067,12 @@ class _FakeS3:
         self.upload_threads: set[str] = set()
         self.completed = None
         self.objects: dict[str, bytes] = {}
+        self.corrupt = corrupt  # flip a byte "in transit", as a bad network would
+        self.create_kwargs: dict = {}
+        self.sent_checksums: dict[int, str | None] = {}
 
     def create_multipart_upload(self, **kw):
+        self.create_kwargs = kw
         return {"UploadId": "UP"}
 
     def upload_part(self, *, Body, PartNumber, **kw):
@@ -1079,8 +1091,20 @@ class _FakeS3:
                 time.sleep(self.delay / PartNumber)
             if PartNumber == self.fail_part:
                 raise RuntimeError(f"boom on part {PartNumber}")
+            received = bytes(Body)
+            if self.corrupt:
+                received = bytes([received[0] ^ 0xFF]) + received[1:]
+            # Like S3: a checksum that does not match the bytes received is refused.
+            sent = kw.get("ChecksumCRC32")
             with self.lock:
-                self.parts[PartNumber] = bytes(Body)
+                self.sent_checksums[PartNumber] = sent
+            if sent is not None and sent != _expected_crc32(received):
+                raise ClientError(
+                    {"Error": {"Code": "BadDigest", "Message": "checksum mismatch"}},
+                    "UploadPart",
+                )
+            with self.lock:
+                self.parts[PartNumber] = received
                 self.events.append(f"part{PartNumber}")
             return {"ETag": f"e{PartNumber}"}
         finally:
@@ -1102,6 +1126,14 @@ class _FakeS3:
     def put_object(self, *, Key, Body, **kw):
         self.objects[Key] = bytes(Body)
         return {}
+
+
+def _expected_crc32(data: bytes) -> str:
+    """CRC32 as S3 wants it, computed independently of the code under test."""
+    import base64
+    import binascii
+
+    return base64.b64encode((binascii.crc32(data) & 0xFFFFFFFF).to_bytes(4, "big")).decode()
 
 
 def _write_all(client, data: bytes, *, threads, chunk=7):
@@ -1408,3 +1440,94 @@ def test_s3_interrupt_before_the_wait_starts_still_aborts_after_uploads_finish(t
     assert client.in_flight_at_abort == [0]
     assert client.events[-1] == "abort"
     assert client.completed is None
+
+
+# ---------------------------------------------------------------------------
+# Part checksum: our own CRC32 instead of boto3's aws-chunked trailer
+# ---------------------------------------------------------------------------
+
+
+def test_crc32_b64_matches_the_standard_check_value():
+    from pgfanout.storage import _crc32_b64
+
+    # CRC-32 of "123456789" is 0xCBF43926, the standard check value.
+    assert _crc32_b64(b"123456789") == "y/Q5Jg=="
+    assert _crc32_b64(b"") == "AAAAAA=="
+    assert _crc32_b64(bytearray(b"123456789")) == "y/Q5Jg=="
+
+
+@pytest.mark.parametrize("threads", [0, 2])
+def test_s3_part_checksum_is_sent_for_every_part_and_repeated_on_complete(tiny_part_size, threads):
+    client = _FakeS3(delay=0.01)
+    data = bytes(range(256)) * 2  # 32 parts of 16 bytes
+    _write_all(client, data, threads=threads)
+    assert client.create_kwargs["ChecksumAlgorithm"] == "CRC32"
+    numbers = [p["PartNumber"] for p in client.completed]
+    assert numbers == list(range(1, 33))
+    for p in client.completed:
+        part = data[(p["PartNumber"] - 1) * 16 : p["PartNumber"] * 16]
+        assert client.sent_checksums[p["PartNumber"]] == _expected_crc32(part)
+        assert p["ChecksumCRC32"] == _expected_crc32(part)  # CompleteMultipartUpload needs it
+
+
+def test_s3_part_checksum_covers_a_short_last_part(tiny_part_size):
+    client = _FakeS3()
+    data = b"x" * 20  # one 16-byte part and a 4-byte last part
+    _write_all(client, data, threads=0)
+    assert [client.sent_checksums[n] for n in (1, 2)] == [
+        _expected_crc32(b"x" * 16),
+        _expected_crc32(b"xxxx"),
+    ]
+
+
+def test_s3_corrupted_part_is_refused_and_the_upload_aborted(tiny_part_size):
+    """The point of the checksum: bytes damaged on the way are not stored."""
+    client = _FakeS3(corrupt=True)
+    with pytest.raises(ClientError, match="BadDigest"):
+        _write_all(client, b"x" * 40, threads=2)
+    assert client.completed is None
+    assert client.events[-1] == "abort"
+
+
+def test_s3_part_upload_avoids_botocores_aws_chunked_path(tiny_part_size):
+    """What actually goes on the wire: the part body as plain bytes with our checksum
+    header, not wrapped in aws-chunked with a trailing checksum (the slow path)."""
+    from botocore.awsrequest import AWSResponse
+    from botocore.httpchecksum import AwsChunkedWrapper
+
+    seen = {}
+
+    class _EmptyBody:
+        content = b""
+
+        def stream(self, *a, **k):
+            return iter(())
+
+    def capture(request, **_):
+        seen["method"] = request.method
+        seen["headers"] = {
+            k.lower(): v.decode() if isinstance(v, bytes) else v for k, v in request.headers.items()
+        }
+        seen["body"] = request.body
+        return AWSResponse(request.url, 200, {"ETag": '"e1"'}, _EmptyBody())
+
+    client = boto3.client(
+        "s3",
+        region_name="us-east-1",
+        aws_access_key_id="AKIATEST",
+        aws_secret_access_key="secret",
+    )
+    client.meta.events.register("before-send.s3.UploadPart", capture)
+    body = b"y" * 40
+    writer = S3Blob("b", "k", client=client, part_size=tiny_part_size)
+    w = writer.open_write()
+    w._upload_id = "UP1"
+    part = w._upload_part(1, body)
+    headers = seen["headers"]
+    assert seen["method"] == "PUT"
+    assert headers["x-amz-checksum-crc32"] == _expected_crc32(body)
+    assert "aws-chunked" not in headers.get("content-encoding", "")
+    assert "x-amz-trailer" not in headers
+    assert not isinstance(seen["body"], AwsChunkedWrapper)
+    assert seen["body"].read() == body  # the part itself, unwrapped
+    assert part["ChecksumCRC32"] == _expected_crc32(body)

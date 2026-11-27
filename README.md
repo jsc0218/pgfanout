@@ -257,6 +257,13 @@ endpoint is down, or `s3:AbortMultipartUpload` is not allowed), the uploaded
 parts stay and keep accruing storage charges, so add a bucket lifecycle rule
 that aborts incomplete multipart uploads. See `src/pgfanout/storage.py`.
 
+Every uploaded part carries a CRC32, which pgfanout computes itself (with
+`zlib`, in C) and sends as a plain header; a store that verifies it rejects a
+part whose bytes do not match. boto3's own default does the same job by sending each part through a
+Python-level `aws-chunked` wrapper with a trailing checksum, which is much
+slower for 16 MiB parts. Checked against AWS S3, MinIO, Ceph RGW (Quincy and
+Squid) and moto; MinIO verifies the checksum, Ceph accepts it without checking.
+
 ## 📝 Config file
 
 CLI flags can be defaulted from a TOML config.  Load order (first match wins):
