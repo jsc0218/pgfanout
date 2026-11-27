@@ -2,11 +2,17 @@
 """Client-side S3 upload benchmark: the cost of getting a dump into S3.
 
 N workers each stream a file through pgfanout's real relay into its real S3
-multipart writer, over HTTPS to a local server that discards what it receives.
-There is no PostgreSQL and no real S3, so what is measured is the work the
-tool itself does per byte (hashing, copying, wrapping, TLS) and nothing the
-network or a store adds. That is where a regression such as boto3's
-``aws-chunked`` trailer checksum shows up (35-43% longer dumps at 8+ workers).
+multipart writer and boto3 client. The network is replaced by a hook that
+answers every request in-process, after reading each part body the way
+urllib3 would when sending it. There is no PostgreSQL, no S3, no sockets and
+no TLS, so what is measured is the work the tool and boto3 do per byte
+(hashing, copying, wrapping the body) and nothing a store or the network adds.
+That is where a regression such as boto3's ``aws-chunked`` trailer checksum
+shows up (it made dumps with 8+ workers take 35-43% longer).
+
+Server-side and network behaviour are out of scope by design: they are what
+made an earlier version with a local HTTPS server too noisy to be useful (the
+transport cost buried the signal).
 
 It is a regression test, not a source of absolute numbers. The metric is CPU
 seconds of the client process per GiB, which moves far less on a shared runner
@@ -33,106 +39,17 @@ import os
 import platform
 import resource
 import shutil
-import ssl
 import statistics
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
 
 GIB = 1 << 30
 MIB = 1 << 20
 BUCKET = "bench"
-
-
-# --------------------------------------------------------------------------
-# Server: speaks just enough S3 multipart to take an upload and drop the bytes
-# --------------------------------------------------------------------------
-
-
-class _Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *args):  # silence the per-request log
-        pass
-
-    def _discard_body(self) -> None:
-        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
-            while True:
-                size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
-                if size == 0:
-                    while self.rfile.readline().strip():  # optional trailer headers
-                        pass
-                    return
-                self._skip(size)
-                self.rfile.readline()  # CRLF after the chunk
-        else:
-            self._skip(int(self.headers.get("Content-Length") or 0))
-
-    def _skip(self, n: int) -> None:
-        while n > 0:
-            got = self.rfile.read(min(n, MIB))
-            if not got:
-                raise ConnectionError("short body")
-            n -= len(got)
-
-    def _reply(self, status: int, body: bytes = b"", headers: dict | None = None) -> None:
-        self.send_response(status)
-        self.send_header("Content-Length", str(len(body)))
-        for k, v in (headers or {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
-
-    def do_POST(self):
-        self._discard_body()
-        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
-        if "uploads" in query:
-            xml = (
-                '<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult>'
-                f"<Bucket>{BUCKET}</Bucket><Key>k</Key><UploadId>bench</UploadId>"
-                "</InitiateMultipartUploadResult>"
-            )
-        else:
-            xml = (
-                '<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult>'
-                f"<Bucket>{BUCKET}</Bucket><Key>k</Key><ETag>&quot;done&quot;</ETag>"
-                "</CompleteMultipartUploadResult>"
-            )
-        self._reply(200, xml.encode(), {"Content-Type": "application/xml"})
-
-    def do_PUT(self):
-        self._discard_body()
-        self._reply(200, headers={"ETag": '"part"'})
-
-    def do_DELETE(self):
-        self._reply(204)
-
-
-def serve() -> None:
-    """Child mode: run the discard server, print "PORT CERT" and wait."""
-    tmp = tempfile.mkdtemp(prefix="s3relay-")
-    key, cert = os.path.join(tmp, "key.pem"), os.path.join(tmp, "cert.pem")
-    subprocess.run(
-        [
-            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-            "-keyout", key, "-out", cert, "-subj", "/CN=127.0.0.1",
-            "-addext", "subjectAltName=IP:127.0.0.1",
-        ],
-        check=True,
-        capture_output=True,
-    )  # fmt: skip
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(cert, key)
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-    srv.daemon_threads = True
-    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
-    print(srv.server_address[1], cert, flush=True)
-    srv.serve_forever()
+READ_SIZE = 16384  # what urllib3 reads from a request body per send
 
 
 # --------------------------------------------------------------------------
@@ -142,20 +59,48 @@ def serve() -> None:
 
 def client(args) -> None:
     import boto3
-    from botocore.config import Config
+    from botocore.awsrequest import AWSResponse
 
     from pgfanout import common
     from pgfanout.storage import S3Blob
 
+    class _Body:
+        def __init__(self, content: bytes = b""):
+            self.content = content
+
+        def stream(self, *a, **k):
+            return iter([self.content])
+
+    def answer(request, **_):
+        """Stand in for the network: read the body the way urllib3 would, then reply."""
+        body = request.body
+        if hasattr(body, "read"):
+            while body.read(READ_SIZE):
+                pass
+        query = request.url.partition("?")[2]
+        if request.method == "POST" and "uploads" in query:
+            xml = (
+                "<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>"
+                "<UploadId>bench</UploadId></InitiateMultipartUploadResult>"
+            )
+        elif request.method == "POST":
+            xml = (
+                "<CompleteMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>"
+                "<ETag>&quot;done&quot;</ETag></CompleteMultipartUploadResult>"
+            )
+        else:
+            xml = ""
+        return AWSResponse(request.url, 200, {"ETag": '"part"'}, _Body(xml.encode()))
+
+    # https, because that is where boto3 wraps each part for its trailing checksum.
     s3 = boto3.client(
         "s3",
         region_name="us-east-1",
-        endpoint_url=f"https://127.0.0.1:{args.port}",
-        verify=args.cert,
+        endpoint_url="https://s3.bench.invalid",
         aws_access_key_id="bench",
         aws_secret_access_key="bench",
-        config=Config(s3={"addressing_style": "path"}),
     )
+    s3.meta.events.register("before-send.s3", answer)
     errors: list[BaseException] = []
 
     def work(i: int) -> None:
@@ -207,10 +152,7 @@ def pgfanout_version(python: str) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--client", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--port", type=int, help=argparse.SUPPRESS)
-    ap.add_argument("--cert", help=argparse.SUPPRESS)
     ap.add_argument("--source", help=argparse.SUPPRESS)
     ap.add_argument("--variant", action="append", type=parse_variant, default=[])
     ap.add_argument("--base", default="base", help="variant name of the baseline build")
@@ -225,8 +167,6 @@ def main() -> None:
     ap.add_argument("--fail", action="store_true", help="exit 1 on regression")
     args = ap.parse_args()
 
-    if args.serve:
-        return serve()
     if args.client:
         return client(args)
 
@@ -234,8 +174,6 @@ def main() -> None:
     for name in (args.base, args.pr):
         if name not in variants:
             sys.exit(f"variant {name!r} not given (have: {', '.join(variants) or 'none'})")
-    if not shutil.which("openssl"):
-        sys.exit("openssl is needed for the local TLS server")
 
     workdir = tempfile.mkdtemp(prefix="s3relay-run-")
     source = os.path.join(workdir, "source.bin")
@@ -244,24 +182,14 @@ def main() -> None:
         for _ in range(args.mb_per_worker):
             f.write(block)
 
-    server = subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "--serve"],
-        stdout=subprocess.PIPE,
-        text=True,
-    )
     try:
-        line = server.stdout.readline().split()
-        if len(line) != 2:
-            sys.exit("the local S3 server did not start")
-        port, cert = line
         env = {**os.environ, "AWS_EC2_METADATA_DISABLED": "true"}
 
         def run_one(name: str) -> dict:
             out = subprocess.run(
                 [
                     variants[name], os.path.abspath(__file__), "--client",
-                    "--port", port, "--cert", cert, "--source", source,
-                    "--workers", str(args.workers),
+                    "--source", source, "--workers", str(args.workers),
                 ],
                 capture_output=True,
                 text=True,
@@ -286,7 +214,6 @@ def main() -> None:
                       f"{r['mb_per_s']:.0f} MB/s" + ("  (warm-up)" if not rnd else ""),
                       file=sys.stderr, flush=True)  # fmt: skip
     finally:
-        server.terminate()
         shutil.rmtree(workdir, ignore_errors=True)
 
     meta = {
@@ -310,7 +237,7 @@ def main() -> None:
     lines = [
         "### pgfanout S3 upload (client side)\n",
         f"{args.workers} workers x {args.mb_per_worker} MiB through the real relay and S3 writer "
-        f"to a local HTTPS server that discards the data, median of {args.repeats} interleaved "
+        f"with the network replaced by an in-process stub, median of {args.repeats} interleaved "
         f"rounds, {meta['cpus']} logical CPUs. Lower CPU per GiB is better.\n",
         "| | base | PR | change | verdict |",
         "|---|---|---|---|---|",

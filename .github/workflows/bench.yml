@@ -211,10 +211,10 @@ jobs:
           exit $status
 
       # The dump benchmark above writes to local disk, so it cannot see the
-      # cost of the S3 writer. This one runs the real relay and S3 writer
-      # against a local HTTPS server that discards the data (bench/s3_relay.py),
-      # which is where boto3's aws-chunked trailer checksum cost 35-43% of a
-      # dump. It runs even if the step above failed, so both results are shown.
+      # cost of the S3 writer. This one runs the real relay, S3 writer and boto3
+      # client with the network stubbed out (bench/s3_relay.py), which is where
+      # boto3's aws-chunked trailer checksum cost 35-43% of a dump. It runs even
+      # if the step above failed, so both results are shown.
       - name: S3 upload, client side
         if: ${{ !cancelled() }}
         run: |
