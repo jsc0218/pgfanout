@@ -76,12 +76,17 @@ def test_single_adds_a_speedup_table_and_never_gates(tmp_path, results):
     assert "| dump | 6.6s | 3.3s | 2.00x | 100% |" in out.stdout
 
 
+def _table_header(stdout):
+    return next(line for line in stdout.splitlines() if line.startswith("| phase | base"))
+
+
 def test_reference_adds_a_column_only_when_given(tmp_path, results):
     base = ("--base", "base@2", "--pr", "pr@2")
     with_ref = _run(tmp_path, results, *base, "--reference", "pg_dump-j1")
-    assert "vs pg_dump-j1" in with_ref.stdout and "faster" in with_ref.stdout
+    assert "vs pg_dump-j1" in _table_header(with_ref.stdout)
+    assert "faster" in with_ref.stdout
     without = _run(tmp_path, results, *base)
-    assert "vs " not in without.stdout.split("\n\n")[2]  # the table header
+    assert "vs " not in _table_header(without.stdout)
 
 
 def test_title_names_the_report(tmp_path, results):

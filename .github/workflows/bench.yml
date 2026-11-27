@@ -36,10 +36,10 @@ name: Benchmark
 #     here. So the floor is what makes 5% usable, and a single flagged dump
 #     result should be re-run before it is treated as a regression.
 #     (Those 18 runs were the local run at 4 jobs. The current setup, at 2 jobs,
-#     differed by -6.0% to +1.4% on local dump (the -6.0% was 0.1s), -0.8% to
-#     +0.4% on local restore, +0.4% to +1.1% on S3 dump and -1.2% to +0.4% on S3
-#     restore over three runs; its 2-job speedup over one job varied by about
-#     0.1x between VMs, which is why it is shown and not gated.)
+#     differed over four runs by -6.0% to +3.2% on local dump (the -6.0% was
+#     0.1s), -2.1% to +0.4% on local restore, -3.7% to +1.1% on S3 dump and
+#     -1.2% to +0.4% on S3 restore; its 2-job speedup over one job varied by
+#     about 0.1x between VMs, which is why it is shown and not gated.)
 #   * Server and clients share the runner's 4 vCPUs, which are 2 physical
 #     cores with 2 hyper-threads each. A worker costs about 1.4 cores (server
 #     backend plus psql), so the speedup here is capped well below the number
