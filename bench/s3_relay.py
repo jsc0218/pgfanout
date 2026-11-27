@@ -14,9 +14,11 @@ Server-side and network behaviour are out of scope by design: they are what
 made an earlier version with a local HTTPS server too noisy to be useful (the
 transport cost buried the signal).
 
-It is a regression test, not a source of absolute numbers. The metric is CPU
-seconds of the client process per GiB, which moves far less on a shared runner
-than wall time. Wall-clock MB/s is shown for context only.
+It is a regression test, not a source of absolute numbers. The gate is
+throughput (MB/s, higher is better): the boto3 trailer checksum runs in Python
+under the GIL, so it costs wall time but not extra CPU (a reverted run used
+less CPU per GiB and was 40% slower), which is why CPU per GiB is shown for
+context only. Within one job, identical builds differed by under 1%.
 
 Usage (the orchestrator needs only the standard library; each variant's own
 Python needs boto3, i.e. a pgfanout install):
@@ -27,8 +29,7 @@ Python needs boto3, i.e. a pgfanout install):
 
 Rounds of all variants are interleaved with the order rotated, and a warm-up
 round is dropped. The exit status is 1 only when the PR is slower than the base
-by more than --threshold and by more than --min-abs CPU seconds per GiB, and
---fail was given.
+by more than --threshold in throughput, and --fail was given.
 """
 
 from __future__ import annotations
@@ -160,8 +161,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--mb-per-worker", type=int, default=256)
     ap.add_argument("--repeats", type=int, default=5, help="measured rounds per variant")
-    ap.add_argument("--threshold", type=float, default=0.05, help="allowed increase (0.05 = 5%%)")
-    ap.add_argument("--min-abs", type=float, default=0.1, help="ignore changes under N CPU-s/GiB")
+    ap.add_argument("--threshold", type=float, default=0.05, help="allowed slowdown (0.05 = 5%%)")
     ap.add_argument("--out", default="s3-relay.json")
     ap.add_argument("--report", default=None, help="also write the Markdown here")
     ap.add_argument("--fail", action="store_true", help="exit 1 on regression")
@@ -227,35 +227,36 @@ def main() -> None:
     with open(args.out, "w") as f:
         json.dump({"meta": meta, "results": results}, f, indent=2)
 
-    base = statistics.median(results[args.base]["cpu_s_per_gib"])
-    pr = statistics.median(results[args.pr]["cpu_s_per_gib"])
-    delta = (pr - base) / base if base else 0.0
-    bad = delta > args.threshold and (pr - base) > args.min_abs
-    base_mbs = statistics.median(results[args.base]["mb_per_s"])
-    pr_mbs = statistics.median(results[args.pr]["mb_per_s"])
-    spread = lambda xs: f"{min(xs):.2f}-{max(xs):.2f}"  # noqa: E731
+    med = statistics.median
+    spread = lambda xs, fmt: f"{fmt % min(xs)}-{fmt % max(xs)}"  # noqa: E731
+    base_mbs, pr_mbs = med(results[args.base]["mb_per_s"]), med(results[args.pr]["mb_per_s"])
+    delta = (pr_mbs - base_mbs) / base_mbs  # negative = slower
+    bad = delta < -args.threshold
+    base_cpu, pr_cpu = (
+        med(results[args.base]["cpu_s_per_gib"]),
+        med(results[args.pr]["cpu_s_per_gib"]),
+    )
     lines = [
         "### pgfanout S3 upload (client side)\n",
         f"{args.workers} workers x {args.mb_per_worker} MiB through the real relay and S3 writer "
         f"with the network replaced by an in-process stub, median of {args.repeats} interleaved "
-        f"rounds, {meta['cpus']} logical CPUs. Lower CPU per GiB is better.\n",
+        f"rounds, {meta['cpus']} logical CPUs. Higher throughput is better.\n",
         "| | base | PR | change | verdict |",
         "|---|---|---|---|---|",
-        f"| client CPU, s per GiB | {base:.2f} ({spread(results[args.base]['cpu_s_per_gib'])}) "
-        f"| {pr:.2f} ({spread(results[args.pr]['cpu_s_per_gib'])}) | {delta:+.1%} "
+        f"| throughput, MB/s | {base_mbs:.0f} ({spread(results[args.base]['mb_per_s'], '%.0f')}) "
+        f"| {pr_mbs:.0f} ({spread(results[args.pr]['mb_per_s'], '%.0f')}) | {delta:+.1%} "
         f"| {'regression' if bad else 'ok'} |",
-        f"| throughput, MB/s (context) | {base_mbs:.0f} | {pr_mbs:.0f} "
-        f"| {(pr_mbs - base_mbs) / base_mbs:+.1%} | - |",
+        f"| client CPU, s per GiB (context) | {base_cpu:.2f} | {pr_cpu:.2f} "
+        f"| {(pr_cpu - base_cpu) / base_cpu:+.1%} | - |",
         "",
     ]
     if bad:
         lines.append(
-            f"**Possible regression: client CPU per GiB {delta:+.0%} "
-            f"(over {args.threshold:.0%} and {args.min_abs} CPU-s/GiB).** "
-            "Re-run before trusting a single result."
+            f"**Possible regression: S3 upload throughput {delta:+.0%} "
+            f"(more than {args.threshold:.0%} slower).** Re-run before trusting a single result."
         )
     else:
-        lines.append(f"No regression over {args.threshold:.0%} (and {args.min_abs} CPU-s/GiB).")
+        lines.append(f"No regression over {args.threshold:.0%}.")
     text = "\n".join(lines) + "\n"
     print(text)
     if args.report:

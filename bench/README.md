@@ -102,6 +102,24 @@ python3 bench/sweep_report.py s3-sweep.json
 - S3 timings vary more than a local disk. Use at least 3 repeats and read the
   min-max column.
 
+## S3 upload, client side
+
+`s3_relay.py` measures the cost of the S3 writer itself, with no PostgreSQL and
+no network: 8 workers stream a file through the real relay and multipart
+writer into a boto3 client whose transport is replaced by an in-process stub
+(it reads each part body the way urllib3 would, then answers). The stub keeps
+the HTTPS code path, which is where boto3 wraps each part for its trailing
+checksum. The gate is throughput, because that wrapper runs in Python under
+the GIL and costs time rather than CPU; CPU per GiB is shown for context.
+
+    python3 bench/s3_relay.py --variant base=/path/to/venv-base/bin \
+        --variant pr=/path/to/venv-pr/bin --repeats 5 --fail
+
+Each variant's Python needs boto3 (a pgfanout install). It flags a PR whose
+throughput is more than `--threshold` (5%) below the base, and the workflow
+runs it after the dump benchmark. It cannot see anything a real store or the
+network does, such as a store that rejects a header; test those by hand.
+
 ## What the numbers mean
 
 By default the harness tunes the server for repeatability: it raises
@@ -127,7 +145,8 @@ The **Benchmark** workflow runs this on pull requests that touch `src/` or
 push to `main` that touches them (the new commit against the one before it).
 It can also be started by hand from the Actions tab. It fails the job when
 `compare.py` finds a regression (a manual run can turn that off with the
-`enforce` input), and it never runs on a schedule.
+`enforce` input), and it never runs on a schedule. The same job also runs
+`s3_relay.py` (above).
 How it works, how stable it has been, and what it cannot detect (the runner
 has 2 physical cores with hyper-threads, and the server shares them with the
 clients) is documented at the top of
