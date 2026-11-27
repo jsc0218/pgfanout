@@ -102,6 +102,36 @@ python3 bench/sweep_report.py s3-sweep.json
 - S3 timings vary more than a local disk. Use at least 3 repeats and read the
   min-max column.
 
+## S3 in CI
+
+The Benchmark workflow also runs the dump and restore through S3: a local
+versitygw (a POSIX-backed S3 gateway; pinned release, HTTPS with a self-signed
+certificate, data on `/mnt`) stands in for S3, `bench.py --storage` runs the
+base and the PR against it, and `compare.py` applies the same rules as for the
+local run. HTTPS matters because boto3 only wraps each part in its
+trailing-checksum encoding over TLS. It catches breakage and large slowdowns in
+the S3 read and write paths, but the runner's 2 physical cores are shared by
+Postgres, `psql`, pgfanout and the server, so a dump to S3 scales little beyond
+2 jobs and a client-side cost can stay hidden. Use `--storage` on a dedicated
+machine for that. versitygw was chosen over SeaweedFS because it needs about a
+third of the CPU per dump, which leaves the runner's cores to the thing being
+measured.
+
+## One job against `pg_dump`
+
+The local report's `vs pg_dump-j1` column is pgfanout at 2 jobs against
+`pg_dump -Fd -Z 0 -j 1`; a higher `-j` does not help `pg_dump` on a single table
+(7.3s at 1, 2 and 4 jobs in a sweep), so its job count hardly matters on this
+dataset, and the one-job pgfanout row of the speedup table is the like-for-like
+single-thread figure. They are not expected to take the same time, and the difference is not the
+harness. `pg_dump` has no binary format for table data (its directory and custom
+formats carry text COPY), whereas pgfanout copies in binary, which is cheaper to
+produce and to load: on the CI runner a plain `psql` COPY of the table took 3.1s
+as text and 2.5s as binary, and loading it took 3.9s as text and 2.6s as binary.
+On top of that `pg_dump` itself needs 6.6s for what a plain text COPY does in
+3.1s. One job of pgfanout (3.1s) therefore lands near a plain text COPY, and
+`pg_restore` (4.1s) near a plain text load.
+
 ## What the numbers mean
 
 By default the harness tunes the server for repeatability: it raises
@@ -125,9 +155,11 @@ the measured rounds.
 The **Benchmark** workflow runs this on pull requests that touch `src/` or
 `bench/` (the base branch against the PR, on the same runner) and on every
 push to `main` that touches them (the new commit against the one before it).
-It can also be started by hand from the Actions tab. It fails the job when
-`compare.py` finds a regression (a manual run can turn that off with the
-`enforce` input), and it never runs on a schedule.
+It can also be started by hand from the Actions tab. It runs the dump and
+restore to local disk and then through S3 (see above), at 1 and 2 jobs, and
+fails the job when `compare.py` finds a regression at 2 jobs in either (a
+manual run can turn that off with the `enforce` input). It never runs on a
+schedule.
 How it works, how stable it has been, and what it cannot detect (the runner
 has 2 physical cores with hyper-threads, and the server shares them with the
 clients) is documented at the top of
