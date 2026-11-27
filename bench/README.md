@@ -105,14 +105,29 @@ python3 bench/sweep_report.py s3-sweep.json
 ## S3 in CI
 
 The Benchmark workflow also runs the dump and restore through S3: a local
-SeaweedFS (pinned release, HTTPS with a self-signed certificate, data on
-`/mnt`) stands in for S3, `bench.py --storage` runs the base and the PR against
-it, and `compare.py` applies the same rules as for the local run. HTTPS matters
-because boto3 only wraps each part in its trailing-checksum encoding over TLS.
-It catches breakage and large slowdowns in the S3 read and write paths, but a
-runner's 4 shared vCPUs hide a client-side cost: with the checksum fix of #19
-reverted, its dump moved only 1-3%. Use `--storage` on a dedicated machine for
-that.
+versitygw (a POSIX-backed S3 gateway; pinned release, HTTPS with a self-signed
+certificate, data on `/mnt`) stands in for S3, `bench.py --storage` runs the
+base and the PR against it, and `compare.py` applies the same rules as for the
+local run. HTTPS matters because boto3 only wraps each part in its
+trailing-checksum encoding over TLS. It catches breakage and large slowdowns in
+the S3 read and write paths, but the runner's 2 physical cores are shared by
+Postgres, `psql`, pgfanout and the server, so a dump to S3 stops scaling after
+2 jobs and a client-side cost can stay hidden. Use `--storage` on a dedicated
+machine for that. versitygw was chosen over SeaweedFS because it needs about a
+third of the CPU per dump, which leaves the runner's cores to the thing being
+measured.
+
+## One job against `pg_dump`
+
+The local report compares pgfanout with `pg_dump -Fd -Z 0 -j 1` (single job).
+They are not expected to take the same time, and the difference is not the
+harness. `pg_dump` has no binary format for table data (its directory and custom
+formats carry text COPY), whereas pgfanout copies in binary, which is cheaper to
+produce and to load: on the CI runner a plain `psql` COPY of the table took 3.1s
+as text and 2.5s as binary, and loading it took 3.9s as text and 2.6s as binary.
+On top of that `pg_dump` itself needs 6.6s for what a plain text COPY does in
+3.1s. One job of pgfanout (3.1s) therefore lands near a plain text COPY, and
+`pg_restore` (4.1s) near a plain text load.
 
 ## What the numbers mean
 
