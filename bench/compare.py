@@ -45,11 +45,17 @@ def main() -> None:
     ap.add_argument("--min-abs", type=float, default=0.2, help="ignore slowdowns under N seconds")
     ap.add_argument("--fail", action="store_true", help="exit 1 on regression")
     ap.add_argument("--title", default="pgfanout benchmark", help="heading of the report")
+    ap.add_argument(
+        "--single",
+        default=None,
+        help="variant name of the same build run with one job; shown as the speedup of "
+        "the --pr build over it, never gates",
+    )
     args = ap.parse_args()
 
     data = json.load(open(args.results))
     meta, res = data["meta"], data["results"]
-    for name in (args.base, args.pr):
+    for name in (args.base, args.pr, *([args.single] if args.single else [])):
         if name not in res:
             sys.exit(f"variant {name!r} not in results (have: {', '.join(res)})")
 
@@ -89,6 +95,17 @@ def main() -> None:
         print(f"**Possible regression:** {', '.join(regressions)}. Re-run to rule out noise.")
     else:
         print("No regression beyond the threshold.")
+
+    if args.single:
+        one, many = res[args.single], res[args.pr]
+        n1, n = one.get("jobs", 1), many.get("jobs", meta["jobs"])
+        print(f"\n**Speedup over one job** (the PR build, {n1} job and {n} jobs; context only)\n")
+        print(f"| phase | {n1} job | {n} jobs | speedup | efficiency |")
+        print("|---|---|---|---|---|")
+        for phase, key in (("dump", "dump_s"), ("restore", "restore_s")):
+            t1, tn = statistics.median(one[key]), statistics.median(many[key])
+            sp = t1 / tn
+            print(f"| {phase} | {t1:.1f}s | {tn:.1f}s | {sp:.2f}x | {sp / (n / n1):.0%} |")
 
     if regressions and args.fail:
         sys.exit(1)

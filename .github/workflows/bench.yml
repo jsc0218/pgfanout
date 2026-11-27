@@ -191,7 +191,8 @@ jobs:
             --variant base=pgfanout:/tmp/venv-base/bin \
             --variant pr=pgfanout:/tmp/venv-pr/bin \
             --variant pg_dump=pgdump \
-            --size-mb "$SIZE_MB" --repeats "$REPEATS" --jobs 4 \
+            --variant pr_1job=pgfanout:/tmp/venv-pr/bin@1 \
+            --size-mb "$SIZE_MB" --repeats "$REPEATS" --jobs-sweep 4 \
             --out bench-results.json
 
       - name: Compare and report
@@ -207,7 +208,7 @@ jobs:
           echo "Fail on regression: ${ENFORCE}." >> "$GITHUB_STEP_SUMMARY"
           set +e
           python3 bench/compare.py bench-results.json \
-            --base base --pr pr --reference pg_dump \
+            --base base@4 --pr pr@4 --reference pg_dump@4 --single pr_1job \
             --threshold "$THRESHOLD" $fail | tee report.md
           status=${PIPESTATUS[0]}
           cat report.md >> "$GITHUB_STEP_SUMMARY"
@@ -263,8 +264,9 @@ jobs:
           /tmp/venv-pr/bin/python bench/bench.py \
             --variant base=pgfanout:/tmp/venv-base/bin \
             --variant pr=pgfanout:/tmp/venv-pr/bin \
+            --variant pr_1job=pgfanout:/tmp/venv-pr/bin@1 \
             --storage s3://bench/ci \
-            --size-mb "$SIZE_MB" --repeats "$REPEATS" --jobs 4 \
+            --size-mb "$SIZE_MB" --repeats "$REPEATS" --jobs-sweep 4 \
             --out bench-results-s3.json
 
       - name: S3 server log
@@ -279,7 +281,8 @@ jobs:
           fail=""
           if [ "$ENFORCE" = "true" ]; then fail="--fail"; fi
           set +e
-          python3 bench/compare.py bench-results-s3.json --base base --pr pr \
+          python3 bench/compare.py bench-results-s3.json --base base@4 --pr pr@4 \
+            --single pr_1job \
             --title "pgfanout benchmark, S3 (SeaweedFS over HTTPS)" \
             --threshold "$THRESHOLD" $fail | tee report-s3.md
           status=${PIPESTATUS[0]}
