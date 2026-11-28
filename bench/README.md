@@ -132,6 +132,55 @@ On top of that `pg_dump` itself needs 6.6s for what a plain text COPY does in
 3.1s. One job of pgfanout (3.1s) therefore lands near a plain text COPY, and
 `pg_restore` (4.1s) near a plain text load.
 
+## Reference numbers
+
+A scaling sweep of the code at commit `9722520`, to compare a future build
+against when the CI job (which only runs 1 and 2 jobs) is not enough.
+
+Machine: AWS c6id.8xlarge (32 vCPU, Intel Xeon Platinum 8375C, local NVMe
+for the server and the dumps), Ubuntu with Linux 7.0, Python 3.14,
+PostgreSQL 18.7 in a container on the same host, default stabilisation
+(`fsync` off). The S3 runs used a bucket in the same region as the instance.
+Each cell is the median of 3 interleaved rounds after a warm-up, in seconds,
+with the minimum and maximum in brackets. Dump and restore use the same
+number of workers (parts).
+
+Local disk (`--size-mb 8000`: a 6.2 GB database, a 5.75 GB dump):
+
+| workers | dump | restore |
+|---|---|---|
+| 1 | 20.1 (20.1-21.1) | 29.2 (29.0-30.1) |
+| 2 | 10.4 (10.3-10.4) | 16.2 (16.1-16.2) |
+| 4 | 5.4 (5.3-5.4) | 10.0 (10.0-10.0) |
+| 8 | 3.9 (3.6-3.9) | 7.9 (7.7-7.9) |
+| 16 | 2.8 (2.8-2.8) | 8.8 (8.8-8.8) |
+| 32 | 2.9 (2.8-2.9) | 9.0 (8.9-9.1) |
+
+S3 (`--size-mb 20000`: a 15.4 GB database, a 14.4 GB dump):
+
+| workers | dump | restore |
+|---|---|---|
+| 1 | 82.5 (82.4-83.1) | 171.0 (161.8-173.8) |
+| 2 | 42.5 (42.3-43.1) | 84.4 (79.6-85.0) |
+| 4 | 22.4 (22.1-22.7) | 44.1 (40.9-44.5) |
+| 8 | 15.0 (14.9-15.1) | 24.4 (24.4-25.6) |
+| 16 | 16.2 (16.1-16.3) | 24.0 (23.6-30.7) |
+| 32 | 17.5 (17.5-18.0) | 24.9 (24.7-25.0) |
+
+Reading them:
+
+- Compare a build against the same row, with the usual 5% and 0.2s rule.
+  Local dump at 8 workers is the exception: it sits close to the limit of
+  one Python process and flips between about 3.0s and 3.7s on the same code,
+  so allow about 15% there (the median of 7 rounds was 3.5s).
+- Nothing gets faster past 16 workers. Dump is limited by the one Python
+  process (about 1 GB/s to S3), restore by PostgreSQL.
+- Absolute times move by about 10% from one machine or day to the next, so
+  rerun the previous build on the same machine in the same session before
+  calling a regression from these numbers alone.
+- The S3 restore rows predate the read-ahead of S3 parts (the restore of a
+  part is one GET stream of about 100 MB/s); refresh them when that merges.
+
 ## What the numbers mean
 
 By default the harness tunes the server for repeatability: it raises
