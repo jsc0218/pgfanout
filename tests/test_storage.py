@@ -1664,6 +1664,28 @@ def test_s3_payload_signing_keeps_the_users_s3_settings(endpoint, no_endpoint_en
 # ---------------------------------------------------------------------------
 
 
+class _PlainBody:
+    """A GetObject stream; every read call takes ``delay`` seconds, like a slow connection."""
+
+    def __init__(self, data, delay, owner):
+        self._data = data
+        self._pos = 0
+        self._delay = delay
+        self._owner = owner
+        self.closed = False
+
+    def read(self, n=None):
+        time.sleep(self._delay)
+        end = len(self._data) if n is None else self._pos + n
+        chunk = self._data[self._pos : end]
+        self._pos += len(chunk)
+        self._owner.plain_bytes += len(chunk)
+        return chunk
+
+    def close(self):
+        self.closed = True
+
+
 class _RangeBody:
     def __init__(self, data):
         self._data = data
@@ -1677,26 +1699,40 @@ class _RangeBody:
 
 
 class _FakeObject:
-    """An S3 client holding one object, serving HeadObject and ranged GetObject."""
+    """An S3 client holding one object: a whole-object GetObject and ranged ones."""
 
-    def __init__(self, data, *, delay=0.0, fail_at=None, short_at=None, other_etag_from=None):
+    def __init__(
+        self,
+        data,
+        *,
+        stream_delay=0.0,
+        delay=0.0,
+        fail_at=None,
+        short_at=None,
+        other_etag_from=None,
+    ):
         import threading
 
         self.data = data
-        self.delay = delay
+        self.stream_delay = stream_delay  # per read call of the plain stream
+        self.delay = delay  # per ranged request
         self.fail_at = fail_at
         self.short_at = short_at
         self.other_etag_from = other_etag_from
         self.lock = threading.Lock()
+        self.plain_gets = 0
+        self.plain_bytes = 0
+        self.plain_body = None
         self.ranges: list[tuple[int, int]] = []
         self.in_flight = 0
         self.max_in_flight = 0
         self.bodies: list[_RangeBody] = []
 
-    def head_object(self, **_):
-        return {"ContentLength": len(self.data), "ETag": '"v1"'}
-
-    def get_object(self, *, Range, **_):
+    def get_object(self, *, Range=None, **_):
+        if Range is None:
+            self.plain_gets += 1
+            self.plain_body = _PlainBody(self.data, self.stream_delay, self)
+            return {"Body": self.plain_body, "ContentLength": len(self.data), "ETag": '"v1"'}
         start, end = (int(x) for x in Range.removeprefix("bytes=").split("-"))
         with self.lock:
             self.ranges.append((start, end))
@@ -1721,77 +1757,120 @@ class _FakeObject:
                 self.in_flight -= 1
 
 
-def _stream(client, *, threads=3, chunk=10, concurrency=1):
-    blob = S3Blob("b", "k", client=client, read_threads=threads, read_chunk_size=chunk)
-    return blob.open_stream(concurrency)
+def _stream(client, *, threads=3, chunk=10):
+    return S3Blob(
+        "b", "k", client=client, read_threads=threads, read_chunk_size=chunk
+    ).open_stream()
 
 
+def _slow(data, **kw):
+    """A store whose one stream is slower than the reader, so the reader switches to ranges."""
+    return _FakeObject(data, stream_delay=0.01, **kw)
+
+
+def _drain(reader, step):
+    out = bytearray()
+    while chunk := reader.read(step):
+        out += chunk
+    return bytes(out)
+
+
+@pytest.mark.parametrize("slow", [False, True])
 @pytest.mark.parametrize("size", [0, 1, 9, 10, 11, 100, 107])
 @pytest.mark.parametrize("step", [None, 1, 7, 10, 33, 1000])
-def test_s3_read_ahead_returns_the_object_in_order(size, step):
+def test_s3_read_ahead_returns_the_object_in_order(slow, size, step):
     data = (bytes(range(256)) * 2)[:size]
-    client = _FakeObject(data)
-    out = bytearray()
+    client = _slow(data) if slow else _FakeObject(data)
     with _stream(client) as r:
-        if step is None:
-            out += r.read()
-        else:
-            while chunk := r.read(step):
-                out += chunk
+        out = r.read() if step is None else _drain(r, step)
         assert r.read(5) == b""  # at the end it stays at the end
-    assert bytes(out) == data
+    assert out == data
 
 
-def test_s3_read_ahead_asks_for_every_byte_once_in_chunk_sized_ranges():
-    data = os.urandom(95)
+def test_s3_read_ahead_stays_a_plain_stream_while_the_caller_is_the_slow_side():
+    """A fast store: reads return at once, so the caller is what limits and nothing changes."""
+    data = os.urandom(120)
     client = _FakeObject(data)
-    with _stream(client, chunk=10) as r:
-        assert r.read() == data
-    assert sorted(client.ranges) == [(i, min(i + 9, 94)) for i in range(0, 95, 10)]
-    assert all(body.closed for body in client.bodies)
+    with _stream(client) as r:
+        out = bytearray()
+        while chunk := r.read(5):
+            out += chunk
+            time.sleep(0.005)  # a consumer that takes longer than the store
+    assert bytes(out) == data
+    assert client.plain_gets == 1 and client.ranges == []
 
 
-def test_s3_read_ahead_keeps_several_requests_in_flight_but_no_more_than_threads():
-    client = _FakeObject(os.urandom(200), delay=0.05)
+def test_s3_read_ahead_switches_to_ranges_when_the_stream_is_the_slow_side():
+    data = os.urandom(200)
+    client = _slow(data, delay=0.02)
     with _stream(client, threads=3, chunk=10) as r:
-        assert len(r.read()) == 200
+        assert _drain(r, 5) == data
+    assert client.plain_gets == 1 and client.plain_body.closed
+    ranges = sorted(client.ranges)
+    assert ranges, "never switched"
+    # the ranges carry on exactly where the plain stream stopped, once each
+    assert ranges[0][0] == client.plain_bytes
+    assert [b + 1 for _, b in ranges[:-1]] == [a for a, _ in ranges[1:]]
+    assert ranges[-1][1] == len(data) - 1
     assert 2 <= client.max_in_flight <= 3
 
 
+def test_s3_read_ahead_closes_every_range_body():
+    client = _slow(os.urandom(100))
+    with _stream(client) as r:
+        assert len(_drain(r, 10)) == 100
+    assert client.bodies and all(body.closed for body in client.bodies)
+
+
 def test_s3_read_ahead_stops_fetching_once_closed():
-    client = _FakeObject(os.urandom(1000), delay=0.02)
+    client = _slow(os.urandom(2000), delay=0.02)
     with _stream(client, threads=2, chunk=10) as r:
-        assert len(r.read(15)) == 15
+        assert len(_drain_n(r, 40)) == 40  # past the switch to ranges
     time.sleep(0.2)  # whatever was already on the wire has finished by now
     asked = len(client.ranges)
     time.sleep(0.2)
-    assert len(client.ranges) == asked < 100
+    assert len(client.ranges) == asked < 200
     with pytest.raises(ValueError, match="closed"):
         r.read(1)
 
 
+def _drain_n(reader, n):
+    out = bytearray()
+    while len(out) < n and (chunk := reader.read(5)):
+        out += chunk
+    return bytes(out)
+
+
 def test_s3_read_ahead_raises_a_failed_range_where_it_is_read():
-    client = _FakeObject(os.urandom(100), fail_at=30)
+    client = _slow(os.urandom(100), fail_at=40)
     with _stream(client, threads=2, chunk=10) as r:
-        assert len(r.read(30)) == 30  # the ranges before it are fine
+        assert len(_drain_n(r, 40)) == 40  # everything before the failed range is fine
         with pytest.raises(ClientError, match="InternalError"):
-            r.read(10)
+            _drain(r, 5)
 
 
 def test_s3_read_ahead_notices_an_object_replaced_while_it_is_read():
-    client = _FakeObject(os.urandom(100), other_etag_from=50)
+    client = _slow(os.urandom(100), other_etag_from=50)
     with _stream(client, threads=2, chunk=10) as r:
-        r.read(50)
+        _drain_n(r, 50)
         with pytest.raises(OSError, match="changed while"):
-            r.read(10)
+            _drain(r, 5)
 
 
 def test_s3_read_ahead_treats_a_short_range_as_an_error():
-    client = _FakeObject(os.urandom(100), short_at=20)
+    client = _slow(os.urandom(100), short_at=40)
     with _stream(client, threads=2, chunk=10) as r:
-        r.read(20)
+        _drain_n(r, 40)
         with pytest.raises(OSError, match="short read"):
-            r.read(10)
+            _drain(r, 5)
+
+
+def test_s3_read_ahead_does_not_switch_for_the_last_chunk():
+    """Less than a chunk left: a ranged request would only add a round trip."""
+    client = _slow(os.urandom(25))
+    with _stream(client, chunk=10) as r:
+        assert len(_drain(r, 5)) == 25
+    assert client.ranges == []
 
 
 @pytest.mark.parametrize(

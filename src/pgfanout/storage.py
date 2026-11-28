@@ -24,6 +24,7 @@ import base64
 import os
 import struct
 import tempfile
+import time
 import zlib
 from abc import ABC, abstractmethod
 from collections import deque
@@ -144,6 +145,8 @@ S3_READ_STREAMS = 8
 S3_MAX_READ_THREADS = 4  # per part; stays inside botocore's default pool of 10 connections
 S3_READ_THREADS_ENV = "PGFANOUT_S3_READ_THREADS"
 S3_READ_CHUNK_SIZE = 16 << 20
+S3_READ_PROBE_CHUNKS = 2  # chunks of the plain stream timed before deciding
+S3_READ_STARVED = 0.5  # switch when read() blocked for more than this share of the time
 
 
 def is_s3_uri(uri: str) -> bool:
@@ -606,13 +609,18 @@ class _S3StreamReader:
 
 
 class _S3ReadAheadReader:
-    """Sequential reader that keeps a few ranged GETs in flight.
+    """Sequential reader that switches to ranged read-ahead when the stream is the slow side.
 
-    ``read(n)`` returns the next bytes in order, like a file. The object is fetched in
-    ``chunk_size`` ranges by up to ``threads`` workers, so memory is bounded by
-    ``chunk_size x (threads + 1)``. Every range must come from the same object version
-    (its ETag is checked), a short read is an error, and a failed range is raised by the
-    ``read`` that needs it.
+    It starts exactly like a plain ``GetObject`` stream. While the first
+    ``S3_READ_PROBE_CHUNKS`` chunks go by it times how long ``read`` blocks against how
+    long the caller takes between reads; if it blocked more than ``S3_READ_STARVED`` of
+    the time (the stream is slower than whatever consumes it, as one S3 GET stream of
+    about 100 MB/s is for a Postgres COPY) it drops the stream and carries on from that
+    offset with ``threads`` ranged GETs of ``chunk_size`` in flight. A fast store never
+    starves the caller, so it never switches and costs what a plain stream does. Memory
+    is bounded by ``chunk_size x (threads + 1)``. Every range must come from the same
+    object version (its ETag is checked), a short read is an error, and a failed range is
+    raised by the ``read`` that needs it.
     """
 
     def __init__(self, client, bucket: str, key: str, chunk_size: int, threads: int):
@@ -623,24 +631,57 @@ class _S3ReadAheadReader:
         self._key = key
         self._chunk = chunk_size
         self._threads = threads
-        self._pool: ThreadPoolExecutor | None = None
-        self._pending: deque[Future] = deque()
-        self._buf = b""
-        self._pos = 0
-        self._next = 0
+        self._body = None  # the plain stream, until it is dropped for ranges
+        self._closed = False
         self._size = 0
         self._etag: str | None = None
+        self._offset = 0  # bytes handed out so far
+        self._t0: float | None = None
+        self._blocked = 0.0
+        self._probing = True
+        self._pool: ThreadPoolExecutor | None = None
+        self._pending: deque[Future] = deque()
+        self._next = 0
+        self._buf = b""
+        self._pos = 0
 
     def __enter__(self) -> _S3ReadAheadReader:
-        head = self._client.head_object(Bucket=self._bucket, Key=self._key)
-        self._size = head["ContentLength"]
-        self._etag = head.get("ETag")
-        if self._size:
-            self._pool = ThreadPoolExecutor(
-                max_workers=self._threads, thread_name_prefix="pgfanout-s3-get"
-            )
-            self._fill()
+        resp = self._client.get_object(Bucket=self._bucket, Key=self._key)
+        self._body = resp["Body"]
+        self._size = resp["ContentLength"]
+        self._etag = resp.get("ETag")
         return self
+
+    # -- plain stream -------------------------------------------------------
+
+    def _read_plain(self, n: int) -> bytes:
+        start = time.perf_counter()
+        data = self._body.read(None if n < 0 else n)
+        now = time.perf_counter()
+        if self._t0 is None:
+            self._t0 = start
+        self._blocked += now - start
+        self._offset += len(data)
+        if self._probing and self._offset >= self._chunk * S3_READ_PROBE_CHUNKS:
+            self._probing = False
+            starved = self._blocked > S3_READ_STARVED * (now - self._t0)
+            if starved and self._size - self._offset >= self._chunk:
+                self._switch_to_ranges()
+        return data
+
+    def _switch_to_ranges(self) -> None:
+        body, self._body = self._body, None
+        try:
+            body.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._pool = ThreadPoolExecutor(
+            max_workers=self._threads, thread_name_prefix="pgfanout-s3-get"
+        )
+        self._next = self._offset
+        self._fill()
+
+    # -- ranged read-ahead --------------------------------------------------
 
     def _fetch(self, start: int, end: int) -> bytes:
         resp = self._client.get_object(
@@ -664,11 +705,9 @@ class _S3ReadAheadReader:
             self._pending.append(self._pool.submit(self._fetch, self._next, end))
             self._next = end + 1
 
-    def read(self, n: int = -1) -> bytes:
-        if self._pool is None and self._size:
-            raise ValueError("read from a closed reader")
+    def _read_ranges(self, n: int) -> bytes:
         parts: list[bytes] = []
-        want = None if n is None or n < 0 else n
+        want = None if n < 0 else n
         while want is None or want > 0:
             if self._pos >= len(self._buf):
                 if not self._pending:
@@ -685,14 +724,31 @@ class _S3ReadAheadReader:
             self._pos += take
             if want is not None:
                 want -= take
-        return parts[0] if len(parts) == 1 else b"".join(parts)
+        data = parts[0] if len(parts) == 1 else b"".join(parts)
+        self._offset += len(data)
+        return data
+
+    # -- file interface -----------------------------------------------------
+
+    def read(self, n: int = -1) -> bytes:
+        if self._closed:
+            raise ValueError("read from a closed reader")
+        n = -1 if n is None else n
+        return self._read_plain(n) if self._body is not None else self._read_ranges(n)
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        self._closed = True
+        body, self._body = self._body, None
         pool, self._pool = self._pool, None
         for future in self._pending:
             future.cancel()
         self._pending.clear()
         self._buf = b""
+        try:
+            if body is not None:
+                body.close()
+        except Exception:  # noqa: BLE001
+            pass
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
         return False
