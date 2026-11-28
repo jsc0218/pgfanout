@@ -54,12 +54,11 @@ off for HTTPS endpoints, a client-wide setting): with our own checksum header
 botocore would otherwise SHA-256 every part for the request signature, which was
 about a third of the client CPU of an upload.
 
-On restore each part is read by `_S3ReadAheadReader`. It starts as a plain `GetObject`
-stream and times the first 32 MiB; if `read` blocked for more than half the time (one
-stream moves about 100 MB/s, less than a Postgres COPY takes) it switches to ranged GETs
-of 16 MiB, up to `PGFANOUT_S3_READ_THREADS` in flight (by default chosen from the number
-of parts loaded together so that about 8 streams run in all, and none from 8 parts up),
-handed to `psql` in order. A fast store never starves the reader, so it never switches.
+On restore each part is read by `_S3ReadAheadReader`: one stream moves about 100 MB/s,
+less than a Postgres COPY takes, so the object is fetched as ranged GETs of 16 MiB over
+up to `PGFANOUT_S3_READ_THREADS` connections and handed to `psql` in order. The default
+is chosen from the number of parts loaded together so that about 8 streams run in all,
+and none (a plain stream) from 8 parts up. Local files are read as before.
 
 ## Common to both paths
 

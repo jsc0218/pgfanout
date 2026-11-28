@@ -261,15 +261,13 @@ that aborts incomplete multipart uploads. See `src/pgfanout/storage.py`.
 A restore reads each part file back as one GET stream, which S3 serves at about
 100 MB/s, so reading N parts is capped near N x 100 MB/s however fast the server is
 (a default 4-part restore of a 12 GB table took 33s from S3 against 19s from local
-disk). The reader therefore times the first 32 MiB; if it spent more than half the time
-waiting for the stream, which is slower than what consumes it, it carries on with ranged
-GETs of 16 MiB read ahead, enough to keep about 8 streams going in all: 4 per part
-for 1-2 parts, 3 for 3, 2 for 4-7, and none from 8 parts up, where the single Python
-process is the limit and extra threads only slow it down. A fast store never makes it
-wait, so it keeps the plain stream and pays nothing. The same restore took 22s, and a
-2-part one 34s instead of 70-83s. `PGFANOUT_S3_READ_THREADS` sets the read-ahead per part
-explicitly (`0` never switches). Memory per part file is 16 MiB x (threads + 1). Every
-range must come from the same version of the object (its ETag is checked), and a short
+disk). An S3 part is therefore read with ranged GETs of 16 MiB, several in flight, enough
+to keep about 8 streams going in all: 4 per part for 1-2 parts, 3 for 3, 2 for 4-7, and
+none (a plain stream) from 8 parts up, where the single Python process is the limit and
+extra threads only slow it down. The same restore took 22s, and a 2-part one 34s instead
+of 70-83s. Local files are read as before. `PGFANOUT_S3_READ_THREADS` sets the read-ahead
+per part explicitly (`0` is a plain stream). Memory per part file is 16 MiB x (threads + 1).
+Every range must come from the same version of the object (its ETag is checked), and a short
 read is an error.
 
 Every uploaded part carries a CRC32, which pgfanout computes itself (with
