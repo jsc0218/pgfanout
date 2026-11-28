@@ -24,7 +24,6 @@ import base64
 import os
 import struct
 import tempfile
-import time
 import zlib
 from abc import ABC, abstractmethod
 from collections import deque
