@@ -354,8 +354,8 @@ def copy_part(
     of parts is launched, just to print each part's size in the
     "Starting" log line.  Zero means "unknown, stat it here".
 
-    *readers* is how many parts are being loaded at the same time; an S3 source reads
-    further ahead the fewer there are (see :meth:`storage.Blob.open_stream`).
+    *readers* is how many parts are being loaded at the same time; an S3 source uses
+    more connections per part the fewer there are (see :meth:`storage.Blob.open_stream`).
     """
     size = size_hint if size_hint else source.size()
     LOG.info("[part %d] %s (%.1f MB)", part_index, source.uri, size / 1e6)

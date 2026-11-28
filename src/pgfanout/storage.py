@@ -55,7 +55,7 @@ class Blob(ABC):
     def open_stream(self, concurrency: int = 1) -> BinaryIO:
         """Open for one sequential pass over the whole blob (a restore's data path).
 
-        Same bytes as :meth:`open_read`; a backend may read ahead to keep up.
+        Same bytes as :meth:`open_read`; a backend may use several connections to keep up.
         *concurrency* is how many blobs the caller reads at the same time.
         """
         return self.open_read()
@@ -137,7 +137,7 @@ S3_UPLOAD_THREADS_ENV = "PGFANOUT_S3_UPLOAD_THREADS"
 # Reading a part back is one GET stream of about 100 MB/s, so a restore that reads N
 # parts moves about N x 100 MB/s from S3 whatever the server could take (a default
 # 4-part restore took 35s from S3 against 19s from local disk). The parts are therefore
-# read ahead with ranged GETs, enough of them to keep about S3_READ_STREAMS streams
+# read over several connections with ranged GETs, enough to keep about S3_READ_STREAMS streams
 # going in all, and none from that many parts up: past a few hundred MB/s the single
 # Python process is the limit, and more threads only slow it down.
 S3_READ_STREAMS = 8
@@ -215,14 +215,14 @@ def _upload_threads_from_env() -> int:
 
 
 def _read_threads_from_env() -> int | None:
-    """The explicit read-ahead per part (0 = a plain stream), or None to pick by part count."""
+    """The explicit number of read connections per part (0 = a plain stream), or None to pick by part count."""
     if not (os.environ.get(S3_READ_THREADS_ENV) or "").strip():
         return None
     return _threads_from_env(S3_READ_THREADS_ENV, 0, S3_MAX_READ_THREADS)
 
 
 def _auto_read_threads(concurrency: int) -> int:
-    """Read-ahead per part so that about S3_READ_STREAMS streams run in all."""
+    """Read connections per part so that about S3_READ_STREAMS streams run in all."""
     return min(S3_MAX_READ_THREADS, -(-S3_READ_STREAMS // max(1, concurrency)))
 
 
@@ -605,7 +605,7 @@ class _S3StreamReader:
         return False
 
 
-class _S3ReadAheadReader:
+class _S3ParallelReader:
     """Sequential reader that keeps ``threads`` ranged GETs of ``chunk_size`` in flight.
 
     One S3 GET stream is about 100 MB/s, slower than the Postgres COPY that consumes it,
@@ -633,7 +633,7 @@ class _S3ReadAheadReader:
         self._buf = b""
         self._pos = 0
 
-    def __enter__(self) -> _S3ReadAheadReader:
+    def __enter__(self) -> _S3ParallelReader:
         head = self._client.head_object(Bucket=self._bucket, Key=self._key)
         self._size = int(head["ContentLength"])
         self._etag = head.get("ETag")
@@ -643,7 +643,7 @@ class _S3ReadAheadReader:
         self._fill()
         return self
 
-    # -- ranged read-ahead --------------------------------------------------
+    # -- ranged GETs --------------------------------------------------
 
     def _fetch(self, start: int, end: int) -> bytes:
         resp = self._client.get_object(
@@ -770,7 +770,7 @@ class S3Blob(Blob):
         return _S3StreamReader(self._get_client(), self._bucket, self._key)  # type: ignore[return-value]
 
     def open_stream(self, concurrency: int = 1) -> BinaryIO:
-        """Read ahead with ranged GETs (see :class:`_S3ReadAheadReader`); a plain stream if off.
+        """Read over several connections (see :class:`_S3ParallelReader`); a plain stream if off.
 
         *concurrency* is how many blobs the caller reads at the same time; the fewer, the
         more ranges each one keeps in flight.
@@ -780,7 +780,7 @@ class S3Blob(Blob):
             threads = _auto_read_threads(concurrency)
         if threads <= 1:
             return self.open_read()
-        return _S3ReadAheadReader(  # type: ignore[return-value]
+        return _S3ParallelReader(  # type: ignore[return-value]
             self._get_client(), self._bucket, self._key, self._read_chunk, threads
         )
 

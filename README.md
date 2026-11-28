@@ -240,7 +240,7 @@ and out of `ps` output.
 | `AWS_REGION`                     | Defaults to `us-east-1` when unset (most Ceph/MinIO accept it)  |
 | `AWS_S3_VERIFY_SSL`              | `false` to disable TLS verify, or a path to a CA bundle         |
 | `PGFANOUT_S3_UPLOAD_THREADS`     | Background upload threads per part file, 0-8, default 2 (below) |
-| `PGFANOUT_S3_READ_THREADS`       | Read-ahead GETs per part file on restore, 0-4; unset picks it by part count (below) |
+| `PGFANOUT_S3_READ_THREADS`       | Parallel GETs per part file on restore, 0-4; unset picks it by part count (below) |
 
 Credentials are also read from `~/.aws/credentials` if not set
 explicitly — boto3's default chain applies.
@@ -265,8 +265,8 @@ disk). An S3 part is therefore read with ranged GETs of 16 MiB, several in fligh
 to keep about 8 streams going in all: 4 per part for 1-2 parts, 3 for 3, 2 for 4-7, and
 none (a plain stream) from 8 parts up, where the single Python process is the limit and
 extra threads only slow it down. The same restore took 22s, and a 2-part one 34s instead
-of 70-83s. Local files are read as before. `PGFANOUT_S3_READ_THREADS` sets the read-ahead
-per part explicitly (`0` is a plain stream). Memory per part file is 16 MiB x (threads + 1).
+of 70-83s. Local files are read as before. `PGFANOUT_S3_READ_THREADS` sets the number of
+parallel GETs per part explicitly (`0` is a plain stream). Memory per part file is 16 MiB x (threads + 1).
 Every range must come from the same version of the object (its ETag is checked), and a short
 read is an error.
 

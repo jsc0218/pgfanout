@@ -1660,7 +1660,7 @@ def test_s3_payload_signing_keeps_the_users_s3_settings(endpoint, no_endpoint_en
 
 
 # ---------------------------------------------------------------------------
-# Read-ahead reader (a restore's S3 data path)
+# Parallel reader (a restore's S3 data path)
 # ---------------------------------------------------------------------------
 
 
@@ -1744,7 +1744,7 @@ def _drain(reader, step):
 
 @pytest.mark.parametrize("size", [0, 1, 9, 10, 11, 100, 107])
 @pytest.mark.parametrize("step", [None, 1, 7, 10, 33, 1000])
-def test_s3_read_ahead_returns_the_object_in_order(size, step):
+def test_s3_parallel_reader_returns_the_object_in_order(size, step):
     data = (bytes(range(256)) * 2)[:size]
     with _stream(_FakeObject(data)) as r:
         out = r.read() if step is None else _drain(r, step)
@@ -1752,7 +1752,7 @@ def test_s3_read_ahead_returns_the_object_in_order(size, step):
     assert out == data
 
 
-def test_s3_read_ahead_fetches_each_range_once_with_threads_in_flight():
+def test_s3_parallel_reader_fetches_each_range_once_with_threads_in_flight():
     data = os.urandom(200)
     client = _FakeObject(data, delay=0.02)
     with _stream(client, threads=3, chunk=10) as r:
@@ -1763,14 +1763,14 @@ def test_s3_read_ahead_fetches_each_range_once_with_threads_in_flight():
     assert 2 <= client.max_in_flight <= 3
 
 
-def test_s3_read_ahead_closes_every_range_body():
+def test_s3_parallel_reader_closes_every_range_body():
     client = _FakeObject(os.urandom(100))
     with _stream(client) as r:
         assert len(_drain(r, 10)) == 100
     assert client.bodies and all(body.closed for body in client.bodies)
 
 
-def test_s3_read_ahead_stops_fetching_once_closed():
+def test_s3_parallel_reader_stops_fetching_once_closed():
     client = _FakeObject(os.urandom(2000), delay=0.02)
     with _stream(client, threads=2, chunk=10) as r:
         assert len(_drain_n(r, 40)) == 40  # past the switch to ranges
@@ -1789,7 +1789,7 @@ def _drain_n(reader, n):
     return bytes(out)
 
 
-def test_s3_read_ahead_raises_a_failed_range_where_it_is_read():
+def test_s3_parallel_reader_raises_a_failed_range_where_it_is_read():
     client = _FakeObject(os.urandom(100), fail_at=40)
     with _stream(client, threads=2, chunk=10) as r:
         assert len(_drain_n(r, 40)) == 40  # everything before the failed range is fine
@@ -1797,7 +1797,7 @@ def test_s3_read_ahead_raises_a_failed_range_where_it_is_read():
             _drain(r, 5)
 
 
-def test_s3_read_ahead_notices_an_object_replaced_while_it_is_read():
+def test_s3_parallel_reader_notices_an_object_replaced_while_it_is_read():
     client = _FakeObject(os.urandom(100), other_etag_from=50)
     with _stream(client, threads=2, chunk=10) as r:
         _drain_n(r, 50)
@@ -1805,7 +1805,7 @@ def test_s3_read_ahead_notices_an_object_replaced_while_it_is_read():
             _drain(r, 5)
 
 
-def test_s3_read_ahead_treats_a_short_range_as_an_error():
+def test_s3_parallel_reader_treats_a_short_range_as_an_error():
     client = _FakeObject(os.urandom(100), short_at=40)
     with _stream(client, threads=2, chunk=10) as r:
         _drain_n(r, 40)
@@ -1817,28 +1817,28 @@ def test_s3_read_ahead_treats_a_short_range_as_an_error():
     ("parts", "threads"),
     [(1, 4), (2, 4), (3, 3), (4, 2), (5, 2), (7, 2), (8, 1), (16, 1)],
 )
-def test_s3_read_ahead_threads_follow_the_number_of_parts(parts, threads, monkeypatch):
-    from pgfanout.storage import _S3ReadAheadReader, _S3StreamReader
+def test_s3_parallel_reader_threads_follow_the_number_of_parts(parts, threads, monkeypatch):
+    from pgfanout.storage import _S3ParallelReader, _S3StreamReader
 
     monkeypatch.delenv(storage.S3_READ_THREADS_ENV, raising=False)
     blob = S3Blob("b", "k", client=_FakeObject(b"x"))
     reader = blob.open_stream(parts)
     if threads == 1:
-        assert isinstance(reader, _S3StreamReader)  # a plain stream: no read-ahead
+        assert isinstance(reader, _S3StreamReader)  # a plain stream: no parallel reads
     else:
-        assert isinstance(reader, _S3ReadAheadReader)
+        assert isinstance(reader, _S3ParallelReader)
         assert reader._threads == threads
 
 
 def test_s3_read_threads_env_overrides_the_part_count(monkeypatch):
-    from pgfanout.storage import _S3ReadAheadReader, _S3StreamReader
+    from pgfanout.storage import _S3ParallelReader, _S3StreamReader
 
     client = _FakeObject(b"x")
     monkeypatch.setenv(storage.S3_READ_THREADS_ENV, "0")
     assert isinstance(S3Blob("b", "k", client=client).open_stream(2), _S3StreamReader)
     monkeypatch.setenv(storage.S3_READ_THREADS_ENV, "3")
     reader = S3Blob("b", "k", client=client).open_stream(16)
-    assert isinstance(reader, _S3ReadAheadReader) and reader._threads == 3
+    assert isinstance(reader, _S3ParallelReader) and reader._threads == 3
     for bad in ("x", "-1", str(storage.S3_MAX_READ_THREADS + 1)):
         monkeypatch.setenv(storage.S3_READ_THREADS_ENV, bad)
         with pytest.raises(ValueError, match=storage.S3_READ_THREADS_ENV):
